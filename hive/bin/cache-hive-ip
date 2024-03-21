@@ -1,46 +1,313 @@
 #!/hive/sbin/bash
-##!/usr/bin/env ash
-#export PATH="./:/hive/bin:/hive/sbin:$PATH"
 
 
-#Recreate. Because of shitty picky bugs
-echo "127.0.0.1	localhost.localdomain		localhost" > /etc/hosts
-
-#adds host ip
-#/hive/bin/hostname-check
-
-
-RIG_CONF="/hive-config/rig.conf"
-[ ! -e $RIG_CONF ] && echo "No $RIG_CONF" && exit 1
-. $RIG_CONF
-[[ -z "$HIVE_HOST_URL" ]] && echo "HIVE_HOST_URL is empty" && exit 1
+#
+# Copyright (C) 2016-2020  Hiveon
+# Distributed under GNU GENERAL PUBLIC LICENSE 2.0
+# License information can be found in the LICENSE file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+# Linted by shellcheck 0.3.7
+#
 
 
-#Resolves host and writes it to /etc/hosts
+readonly script_mission='Client for ASICs: Cache the API server address'
+readonly script_mission_description='Resolve API Server hostname and write it to /etc/hosts'
+readonly script_version='0.3.6'
+readonly script_basename="${0##*/}"
 
-SEPARATOR="#HIVE HOST CACHE BEGIN"
-#HOST="hiveos.farm"
-HOST=`echo $HIVE_HOST_URL | awk -F'://' '{print $2}'`
-[[ -z "$HOST" ]] && echo "Unable to parse hostname from $HIVE_HOST_URL" && exit 1
 
-#ent=`getent ahosts $HOST | grep -m 1 STREAM | sed -E 's/(\w+)\s+STREAM\s+(.*)/\1 \2/'`
-ent=`nslookup $HOST | sed -n '/\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}/p' | tail -1 | grep Address | head -n1 | awk -F': ' '{print $2}' | awk '{print $1}'`
-for i in {1..30}; do
-    [[ $ent != "127.0.0.1" ]] && break
-    echo "Waiting for nslookup... $i"
-    sleep 2
-    ent=`nslookup $HOST | sed -n '/\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}/p' | tail -1 | grep Address | head -n1 | awk -F': ' '{print $2}' | awk '{print $1}'`
+# !!! bash strict mode, no unbound variables
+set -o nounset
+
+
+# functions
+
+function echo_action_begin		{ echo -en "${LGRAY-}${script_basename}> ${WHITE-}${*}...${BRED-} "; }
+function echo_action_success	{ echo -e "${BGREEN-}${*}${NOCOLOR-}"; }
+function echo_action_failed		{ echo -e "${BRED-}${*}${NOCOLOR-}"; }
+
+function echo_ok		{ echo -e "${LGRAY-}${script_basename}: ${BGREEN-}${*}${NOCOLOR-}"; }
+function echo_action	{ echo -e "${LGRAY-}${script_basename}> ${WHITE-}${*}...${NOCOLOR-}"; }
+function echo_info		{ echo -e "${LGRAY-}${script_basename}: ${NOCOLOR-}${*}"; }
+function echo_warning	{ echo -e "${LGRAY-}${script_basename}: ${BYELLOW-}${*}${NOCOLOR-}"; }
+function echo_error		{ echo -e "${LGRAY-}${script_basename}: ${BRED-}${*}${NOCOLOR-}"; } 1>&2 # was commented temporary, for cgi-bin script
+
+function die {
+	# !!! must be the first line in this function to catch the incoming error code -- do not move
+	local -r incoming_exitcode=$?
+
+	# args
+	local -r message="$1"
+	local -r exitcode="${2:-$incoming_exitcode}"
+
+	# code
+	[[ -n "$message" ]] && echo_error "$message"
+	exit $(( exitcode ))
+}
+
+function echo_script_version {
+	echo_info "$script_mission $script_version"
+}
+
+function sleep_with_progress_bar {
+	#
+	# print a shrinking progress bar while sleeping
+	#
+	# Usage: sleep_with_progress_bar 'seconds_to_sleep'
+	#
+
+	# args
+	local -r -i seconds_to_sleep="$1"
+
+	# vars
+	local -i this_step
+	local seconds_remaining_as_spaces seconds_remaining_as_dots
+
+	# code
+
+	for (( this_step = 0; this_step < seconds_to_sleep; this_step++ )); do
+		printf -v seconds_remaining_as_spaces '%*s' $(( seconds_to_sleep - this_step ))
+		seconds_remaining_as_dots="${seconds_remaining_as_spaces// /.}"
+		printf '\r%b%s%b%*s\r' "${DGRAY}" "$seconds_remaining_as_dots" "${NOCOLOR}" "$this_step"
+		sleep 1
+	done
+	printf '\r%*s\n' "$seconds_to_sleep" # clear the line and then \n
+}
+
+function gethostbyname {
+	#ent=`getent ahosts $HOST | grep -m 1 STREAM | sed -E 's/(\w+)\s+STREAM\s+(.*)/\1 \2/'`
+	#ping -c1 -t1 -W0 www.example.com &>/dev/null && ping -c1 -t1 -W0 www.example.com 2>&1 | tr -d '():' | awk '/^PING/{print $3}'
+	#ping -q -c1 -t1 your_host_here | grep -Eo "([0-9]+\.?){4}"
+	#nslookup $LINE | awk '/^Address: / { print $1 }'
+
+	# args
+	local -r host="$1"
+	local domain_server="${2-}"
+
+	# vars
+	local nslookup_output
+
+	# code
+	[[ "$domain_server" == 'local' ]] && domain_server=''
+	# shellcheck disable=SC2086
+	if nslookup_output="$( nslookup "$host" $domain_server )"; then
+		echo "$nslookup_output"									|
+			grep -A 4 Name										|	# get a first line starting with 'Name' and +4 lines down
+				sed -n '/\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}/p'	|	# remove all lines without IP addresses
+					tail -1										|	# get the last line
+						grep Address							|	# find 'Address' in that one line
+							head -n1							|	# get the first line
+								awk -F': ' '{print $2}'			|	# split line by ': ', print 2nd field
+									awk '{print $1}'				# split line by ' ', print 1st field
+	else
+		return 1
+	fi
+}
+
+function get_field_from_string {
+	#
+	# Usage: get_field_from_string 'string' 'field_number' 'delimiter'
+	#
+
+	# args
+	local -r string="$1"
+	local -r -i field_number="${2-1}" # default is 1st field
+	local -r delimiter="${3- }" # default is space
+
+	# arrays
+	local IFS
+	local -a string_splitted_to_array
+
+	# code
+	IFS="$delimiter"
+	string_splitted_to_array=( $string )
+	echo "${string_splitted_to_array[field_number-1]-}"
+}
+
+function gethostbyname_new {
+	# args
+	local -r host="$1"
+	local domain_server="${2-}"
+
+	# consts
+	local -r address_re='Address.+:[[:blank:]]?(([0-9]{1,3}\.){3}[0-9]{1,3})'
+
+	# vars
+	local nslookup_output first_stage second_stage
+
+	# code
+	[[ "$domain_server" == 'local' ]] && domain_server=''
+
+	if nslookup_output="$( nslookup "$host" $domain_server | grep -FA4 'Name' | tail +2 )" && [[ -n "$nslookup_output" ]]; then
+		#echo_error "nslookup_output '$nslookup_output'"
+		if [[ $nslookup_output =~ $address_re ]]; then
+			first_stage="$( get_field_from_string "$BASH_REMATCH" 2 ':' )"
+			#echo_error "first_stage '$first_stage'"
+			second_stage="$( get_field_from_string "$first_stage" 1 ' ' )"
+			#echo_error "second_stage '$second_stage'"
+			if [[ -n "$second_stage" ]]; then
+				echo "$second_stage"
+			else
+				#echo_error "second_stage empty"
+				return 1
+			fi
+		else
+			#echo_error "no rematch"
+			return 1
+		fi
+	else
+		#echo_error "no nslookup_output"
+		return 1
+	fi
+}
+
+function set_hosts_file {
+	# consts
+	local -r abracadabra='MTI3LjAuMC4xCWxvY2FsaG9zdC5sb2NhbGRvbWFpbgkJbG9jYWxob3N0Cgo='
+
+	# code
+	case "$ASIC_MODEL" in
+		'Antminer S9k'			|\
+		'Antminer S9 SE')
+			hosts_file='/etc/hosts'
+		;;
+
+		'Antminer S9'			|\
+		'Antminer T17'*			|\
+		'Antminer S17'*			|\
+		'Antminer X17'*			|\
+		'Antminer S19'*			|\
+		'Antminer T19'*			|\
+		'Antminer T9+'*			|\
+		'Antminer T9'*			|\
+		'Antminer S10'*			|\
+		'Antminer S9i'			|\
+		'Antminer S9j'			|\
+		'Antminer S9 SE Hiveon'	|\
+		'Antminer S9k Hiveon'	|\
+		'Minecenter S9'			|\
+		'Antminer S9 Hydro'		|\
+		'Antminer E3'			|\
+		'Antminer '				|\
+		'Antminer S9 (vnish'*	|\
+		'Antminer S9'*			|\
+		'Antminer S11'*)
+			hosts_file='/tmp/hosts'
+			#default for hiveon
+			#127.0.0.1       localhost.localdomain           localhost
+			#
+			if [[ $( md5sum /etc/hosts | awk '{print $1}' ) != '27acad957c7cded40cd6ac50d23ddc66' ]]; then
+				if hash 'base64' 2> /dev/null; then
+					base64 -d <<< "$abracadabra" > /etc/hosts
+				elif hash 'openssl' 2> /dev/null; then
+					openssl base64 -d  <<< "$abracadabra" > /etc/hosts 2> /dev/null
+				fi
+			fi
+		;;
+
+		*)
+			hosts_file='/etc/hosts'
+		;;
+	esac
+}
+
+
+# global sources
+
+source /hive/bin/colors
+source /hive/bin/asic-model
+
+
+# global consts
+
+declare -r RIG_CONF_default='/hive-config/rig.conf'
+declare -r RIG_CONF="${RIG_CONF:-$RIG_CONF_default}" # for ASIC emulator: set to default only if RIG_CONF variable is empty
+declare -r hosts_file_backup='/hive-config/hosts'
+declare -r -a resolvers_list=( 'local' '8.8.8.8' '1.1.1.1' )
+declare -r -i attempts_limit=30
+
+
+# global vars
+
+declare hosts_file HIVE_HOST_URL_stripped ip_address
+declare -i this_attempt
+
+
+# main
+
+echo_script_version
+set_hosts_file
+
+[[ -f "$hosts_file" && -w "$hosts_file" ]]	|| die "$hosts_file is read-only, exiting" 1			# assert hosts file exists and it's writable
+[[ -f "$RIG_CONF" ]]						|| die "$RIG_CONF not found" 1							# assert config exists
+
+source "$RIG_CONF"
+[[ -n "$HIVE_HOST_URL" ]]					|| die 'HIVE_HOST_URL is empty' 1						# assert HIVE_HOST_URL not empty
+
+IFS=/ read -r _ _ HIVE_HOST_URL_stripped <<< "$HIVE_HOST_URL" # get domain name without the trailing slash (and without awk)
+[[ -n "$HIVE_HOST_URL_stripped" ]]			|| die "Unable to parse hostname from $HIVE_HOST_URL" 1	# assert api sever hostname
+
+for (( this_attempt = 1; this_attempt <= attempts_limit; this_attempt++ )); do
+	for this_resolver in "${resolvers_list[@]}"; do
+		echo_action_begin "Resolving '$HIVE_HOST_URL_stripped' by $this_resolver resolver"
+		if ip_address="$( gethostbyname "$HIVE_HOST_URL_stripped" "$this_resolver" )" && [[ -n "$ip_address" && "$ip_address" != '127.0.0.1' ]]; then
+			echo_action_success "$ip_address"
+			break
+		else
+			[[ -n "$ip_address" ]] && echo_action_failed "$ip_address"
+			ip_address=''
+		fi
+	done
+	[[ -n "$ip_address" ]] && break
+
+	(( this_attempt < attempts_limit )) && echo_warning "Still no resolve in attempt #$this_attempt. Wait a bit before starting over..."
+
+	if [[ -t 1 ]]; then
+		sleep_with_progress_bar 2
+	else
+		sleep 2
+	fi
 done
-[[ -z "$ent" ]] && echo "Unable to lookup $HOST" || ent="$ent $HOST"
 
-echo -e "\n$SEPARATOR" >> /etc/hosts
-if [[ -z "$ent" ]]; then
-    echo "Unable to resolve $HOST"
-    ent="#Unable to resolve $HOST" #to place this in file
-else
-    echo "Writing DNS resolve \"$ent\" to /etc/hosts"
+if [[ -z "$ip_address" ]]; then
+	if [[ -f "$hosts_file_backup" ]]; then
+		echo_action "Restoring $hosts_file from $hosts_file_backup"
+		cp -rf "$hosts_file_backup" "$hosts_file"
+	fi
+	die "Unable to resolve $HIVE_HOST_URL_stripped, exiting" 0
 fi
 
-echo "$ent" >> /etc/hosts
+if [[ -s "$hosts_file" ]]; then
+	old_hosts="$( < "$hosts_file" )"
+	old_hosts+=$'\n'
+else
+	echo_error "$hosts_file not found"
+	old_hosts=''
+fi
 
-sync
+new_hosts="# DO NOT EDIT. All changes will be overwritten by $script_basename
+
+127.0.0.1 localhost.localdomain localhost
+
+# HIVE HOST CACHE BEGIN
+$ip_address $HIVE_HOST_URL_stripped
+"
+
+# mind the flash memory wear and tear
+if [[ "$old_hosts" != "$new_hosts" ]]; then
+	echo_action "Updating $hosts_file with a new address"
+	[[ -e "$hosts_file" ]] && rm -rf "${hosts_file:-SAFE}" # covering a weird edge case where hosts_file is a directory
+	echo "$new_hosts" > "$hosts_file"
+	sync
+else
+	echo_info "Server address hasn't been changed, $hosts_file update skipped"
+fi
+
+if [[ -s "$hosts_file_backup" ]] && cmp -s "$hosts_file" "$hosts_file_backup"; then
+	: ok good to go
+else
+	echo_warning "Backup hosts_file $hosts_file_backup is outdated or not found"
+	echo_action "Updating $hosts_file_backup"
+	cp -rf "$hosts_file" "$hosts_file_backup"
+	sync
+fi

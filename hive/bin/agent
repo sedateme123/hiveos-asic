@@ -25,7 +25,7 @@ screen_count=`screen -ls | grep "\.agent" | grep -v $PPID | wc -l`
 
 . asic-model
 echo -e "Detected ASIC model: ${CYAN}$ASIC_MODEL${NOCOLOR}\n"
-[[ $WD_ENABLED=1 ]] && nohup wd stop > /tmp/nohup.out && nohup sleep 5 > /tmp/nohup.out; wd start &
+[[ $WD_ENABLED=1 ]] && nohup wd stop && nohup sleep 5; wd start &
 
 ########################################################################################################################
 
@@ -146,48 +146,6 @@ miner_stats () {
 						'{$algo, $hs, $hs_units, $temp, $board_temp, $fan, $fan_rpm, $freq, $acn, $hw_errors, $status, $uptime}')
 			fi
 		;;
-		"WhatsMiner M10")
-			stats_raw=`echo '{"command":"edevs"}' | timeout -t 7 nc localhost 4028 | tr -d '\0'`
-			if [[ $? -ne 0 || -z $stats_raw ]]; then
-				echo -e "${YELLOW}Failed to read $miner stats from localhost:4028${NOCOLOR}"
-			else
-				stats_raw=$(sed 's/}{/\},{/' <<< "$stats_raw")
-				local STATS=$(jq '.DEVS' <<< "$stats_raw")
-
-				local algo=$ASIC_ALGO
-				local hs_units=$HASH
-				local uptime=$(jq -r '.[0]."Device Elapsed"' <<< "$STATS")
-				khs=$(jq -r '[.[] | with_entries( select(.key == "MHS 5s") ) | to_entries | [.[].value] | add] | add' <<< "$STATS")
-				if [[ $HASH == "mhs" ]]; then
-					khs=$(awk '{print $1 * 1000}' <<< "$khs")
-				elif [[ $HASH == "khs" ]]; then
-					khs=$(awk '{print $1 * 1}' <<< "$khs")
-				else
-					khs=$(awk '{print $1 * 1000000}' <<< "$khs")
-				fi
-
-				local stats_pool=`echo '{"command":"pools"}' | timeout -t 7 nc localhost 4028 | tr -d '\0' | jq '.POOLS'`
-				local active_pool=$(echo $stats_pool | jq '[. as $object | keys[] | select($object[.]."Stratum Active" == true ) as $pool | select($object[$pool]."Getworks")] | .[0]')
-
-				local hs=$( 	 (jq '[.[] | with_entries( select(.key == "MHS 5s") ) 			| to_entries | .[].value]') <<< "$STATS" )
-				local temp=$(	 (jq '[.[] | with_entries( select(.key == "Temperature") ) | to_entries | .[].value]') <<< "$STATS")
-				local fan=$(	 (jq '[.[0] | with_entries( select(.key == "Fan Speed In" or .key == "Fan Speed Out") ) | to_entries | .[].value / '$max_fan_rpm' * 100 ]') <<< "$STATS")
-				local fan_rpm=$( (jq '[.[0] | with_entries( select(.key == "Fan Speed In" or .key == "Fan Speed Out") ) | to_entries | .[].value]') <<< "$STATS")
-				local freq=$(	 (jq '[.[] | with_entries( select(.key == "Chip Frequency") ) | to_entries | .[].value]') <<< "$STATS")
-				local acn=$(	 (jq '[.[] | with_entries( select(.key == "Effective Chips") ) | to_entries | .[].value]') <<< "$STATS")
-				local status=$(	 (jq '[.[] | with_entries( select(.key == "Effective Chips") ) | to_entries | .[].value]') <<< "$STATS")
-				local hw_errors=$( (jq '[.[] | with_entries( select(.key == "Hardware Errors") ) | to_entries | .[].value]') <<< "$STATS")
-				local ar=$(	 (jq -c --arg pool "$active_pool" '.[$pool|tonumber] | with_entries( select(.key == "Accepted" or .key == "Rejected" or .key == "Get Failures") ) | to_entries | [.[].value]') <<< "$stats_pool")
-
-				stats=$(jq -nc \
-						--arg algo "$algo" --argjson hs "$hs" --arg hs_units "$hs_units" \
-						--argjson temp "$temp" --argjson fan "$fan" --argjson fan_rpm "$fan_rpm" \
-						--argjson freq "$freq" --argjson acn "$acn" \
-						--argjson hw_errors "$hw_errors" --argjson status "$status" \
-						--arg uptime "$uptime" --argjson ar "$ar"\
-						'{$algo, $hs, $hs_units, $temp, $fan, $fan_rpm, $freq, $acn, $hw_errors, $status, $uptime, $ar}')
-			fi
-		;;
 		"Zig Z1+"|"Zig Z1")
 			stats_raw=`echo '{"command":"stats"}' | timeout 7 nc localhost 4028 | tr -d '\0'`
 			if [[ $? -ne 0 || -z $stats_raw ]]; then
@@ -215,108 +173,288 @@ miner_stats () {
 				local status=$(	 (jq '.[0] | with_entries( select(.key | test("CH\\d+") ) ) | to_entries | [.[].value | .status | [.[].accept | if . > 0 then  "o" else "x" end ] | join("") ]') <<< "$STATS")
 #				local hw_errors=$( (jq '.[1] | with_entries( select(.key | test("chain_hw\\d+")) ) 	| to_entries | [.[].value]') <<< "$STATS")
 
-				stats=$(jq -nc \
-						--arg algo "$algo" --argjson hs "$hs" --arg hs_units "$hs_units" \
-						--argjson temp "$temp" --argjson fan "$fan" --argjson fan_rpm "$fan_rpm" \
-						--argjson freq "$freq" --argjson acn "$acn" \
-						--argjson status "$status" \
-						--arg uptime "$uptime" \
-						'{$algo, $hs, $hs_units, $temp, $fan, $fan_rpm, $freq, $acn, $status, $uptime}')
-			fi
+			stats="$( jq --null-input --compact-output																		\
+				--arg		'algo'			"$ASIC_ALGO"					--argjson	'hs'		"${hs:-null}"			\
+				--arg		'hs_units'		"$ASIC_CHAIN_HASHRATE_UNITS"	--argjson	'temp'		"${temp:-null}"			\
+				--argjson	'fan'			"${fan_percent:-null}"			--argjson	'fan_rpm'	"${fan_rpm:-null}"		\
+				--argjson	'freq'			"${freq:-null}"					--argjson	'acn'		"${chain_acn:-null}"	\
+				--argjson	'status'		"${chain_acs:-null}"			--argjson	'uptime'	"${uptime:-null}"		\
+																															\
+				'{$algo, $hs, $hs_units, $temp, $fan, $fan_rpm, $freq, $acn, $status, $uptime}'								\
+																															\
+				2> /dev/null
+			)" || error_vars+=( "stats#$?" )
+			(( script_DEBUG )) && debug_print_variable stats ASIC_ALGO hs ASIC_CHAIN_HASHRATE_UNITS temp chip_temp board_temp fan_percent fan_rpm freq freq_new chain_voltage chain_acn power hw_errors chain_acs uptime ar asicboost
 		;;
-		"b29+.g19"|"d9.g19"|"s11.g19")
-			stats_raw=`echo '{"command":"stats"}' | timeout -t 7 nc localhost 4028 | tr -d '\0'`
-			if [[ $? -ne 0 || -z $stats_raw ]]; then
-				echo -e "${YELLOW}Failed to read $miner stats from localhost:4028${NOCOLOR}"
+
+		'b29+.g19'						|\
+		'a9+.g19'						|\
+		'd9.g19'						|\
+		's11.g19'						|\
+		't2t.soc'|'t2t+.soc'			|\
+		't2th.soc'|'t2th+.soc'|'t2thf.soc'|'t2thf+.soc'|'t2thl+.soc'|'t2thm.soc'|\
+		't2ti.soc'						|\
+		't2ts.soc'						|\
+		't2tz.soc'						|\
+		't1.g19'						|\
+		't3.soc'|'t3+.soc'|'t3h+.soc')
+			# echo '{"command":"stats"}' | timeout -t 7 nc localhost 4028 | tr -d '\0\n'
+			if ! stats_raw="$( get_stats_raw )" || [[ -z "$stats_raw" ]]; then
+				log_line warning "Failed to read $miner_name stats from $miner_API_host:$miner_API_port"
+				{ sanitize_total_khs; return; }
+			fi
+
+			STATS="$( jq --compact-output '.STATS' <<< "$stats_raw" )"
+			hashrate_raw="$( jq --raw-output '.[-1] | .[] | add' < /tmp/stats.json )"
+			reduce_hashrate_to_khs "$hashrate_raw" "$ASIC_CHAIN_HASHRATE_UNITS" 'total_khs'
+
+			uptime="$(		jq --raw-output		'.[0].Elapsed'																											<<< "$STATS"		)"
+			hs="$(			jq --raw-output		'[.[-1] | .[] | .[]]'																									< /tmp/stats.json	)" || error_vars+=( "hs#$?" )
+			temp="$(		jq --compact-output	'[.[] | with_entries( select(.key | test("^Temp$")) )			| to_entries | .[].value]'								<<< "$STATS"		)" || error_vars+=( "temp#$?" )
+			fan_percent="$(	jq --compact-output	'[.[] | with_entries( select(.key | test("^Fan duty$")) )		| to_entries | .[].value]'								<<< "$STATS"		)" || error_vars+=( "fan_percent#$?" )
+			freq="$(		jq --compact-output	'[.[] | with_entries( select(.key | test("^PLL")) )				| to_entries | .[].value]'								<<< "$STATS"		)" || error_vars+=( "freq#$?" )
+			chain_acn="$(	jq --compact-output	'[.[] | with_entries( select(.key | test("Num chips")) )		| to_entries | .[].value]'								<<< "$STATS"		)" || error_vars+=( "chain_acn#$?" )
+			chain_acs="$(	jq --compact-output	'[.[] | with_entries( select(.key | test("Num active chips")) )	| to_entries | .[].value]'								<<< "$STATS"		)" || error_vars+=( "chain_acs#$?" )
+			hw_errors="$(	jq --compact-output	'[.[] | with_entries( select(.key | test("HW errors")) )		| to_entries | [.[].value] | add | select(.!=null)]'	<<< "$STATS"		)" || error_vars+=( "hw_errors#$?" )
+
+			stats="$( jq --null-input --compact-output																		\
+				--arg		'algo'			"$ASIC_ALGO"					--argjson	'hs'		"${hs:-null}"			\
+				--arg		'hs_units'		"$ASIC_CHAIN_HASHRATE_UNITS"	--argjson	'temp'		"${temp:-null}"			\
+				--argjson	'fan'			"${fan_percent:-null}"			--argjson	'freq'		"${freq:-null}"			\
+				--argjson	'acn'			"${chain_acn:-null}"			--argjson	'hw_errors'	"${hw_errors:-null}"	\
+				--argjson	'status'		"${chain_acs:-null}"			--argjson	'uptime'	"${uptime:-null}"		\
+																															\
+				'{$algo, $hs, $hs_units, $temp, $fan, $freq, $acn, $hw_errors, $status, $uptime}'							\
+																															\
+				2> /dev/null
+			)" || error_vars+=( "stats#$?" )
+			(( script_DEBUG )) && debug_print_variable stats ASIC_ALGO hs ASIC_CHAIN_HASHRATE_UNITS temp chip_temp board_temp fan_percent fan_rpm freq freq_new chain_voltage chain_acn power hw_errors chain_acs uptime ar asicboost
+		;;
+
+		'T4.G19')
+			# echo '{"command":"stats"}' | timeout -t 7 nc localhost 4028 | tr -d '\0\n'
+			if ! stats_raw="$( send_request_to_miner_api '{"command":"devs"}' )" || [[ -z "$stats_raw" ]]; then
+				log_line warning "Failed to read $miner_name stats from $miner_API_host:$miner_API_port"
+				{ sanitize_total_khs; return; }
+			fi
+
+			STATS="$( jq --compact-output '.DEVS' <<< "$stats_raw" )"
+			hashrate_raw="$( jq --raw-output '[.[]["MHS av"]] | add' <<< "$STATS" )"
+			reduce_hashrate_to_khs "$hashrate_raw" "$ASIC_CHAIN_HASHRATE_UNITS" 'total_khs'
+
+			uptime="$(		jq --raw-output		'.[0]["Device Elapsed"]'																	<<< "$STATS" )"
+			hs="$(			jq --compact-output	'[.[] | with_entries( select(.key | test("MHS 5s")) )			| to_entries | .[].value]'	<<< "$STATS" )" || error_vars+=( "hs#$?" )
+			temp="$(		jq --compact-output	'[.[] | with_entries( select(.key | test("TempAVG")) )			| to_entries | .[].value]'	<<< "$STATS" )" || error_vars+=( "temp#$?" )
+			freq="$(		jq --compact-output	'[.[] | with_entries( select(.key | test("CORE")) )				| to_entries | .[].value]'	<<< "$STATS" )" || error_vars+=( "freq#$?" )
+			chain_acn="$(	jq --compact-output	'[.[] | with_entries( select(.key | test("DUTY")) )				| to_entries | .[].value]'	<<< "$STATS" )" || error_vars+=( "chain_acn#$?" )
+#			chain_acs="$(	jq --compact-output	'[.[] | with_entries( select(.key | test("Num active chips")) )	| to_entries | .[].value]'	<<< "$STATS" )" || error_vars+=( "chain_acs#$?" )
+			hw_errors="$(	jq --compact-output	'[.[] | with_entries( select(.key | test("Hardware Errors")) )	| to_entries | .[].value]'	<<< "$STATS" )" || error_vars+=( "hw_errors#$?" )
+
+			stats="$( jq --null-input --compact-output																		\
+				--arg		'algo'			"$ASIC_ALGO"					--argjson	'hs'		"${hs:-null}"			\
+				--arg		'hs_units'		"$ASIC_CHAIN_HASHRATE_UNITS"	--argjson	'temp'		"${temp:-null}"			\
+				--argjson	'freq'			"${freq:-null}"					--argjson	'acn'		"${chain_acn:-null}"	\
+				--argjson	'hw_errors'		"${hw_errors:-null}"			--argjson	'uptime'	"${uptime:-null}"		\
+																															\
+				'{$algo, $hs, $hs_units, $temp, $freq, $acn, $hw_errors, $uptime}'											\
+																															\
+				2> /dev/null
+			)" || error_vars+=( "stats#$?" )
+			(( script_DEBUG )) && debug_print_variable stats ASIC_ALGO hs ASIC_CHAIN_HASHRATE_UNITS temp chip_temp board_temp fan_percent fan_rpm freq freq_new chain_voltage chain_acn power hw_errors chain_acs uptime ar asicboost
+		;;
+
+		'Toddminer C1'*)
+			stats="$( todd_api stats )"
+			hashrate_raw="$( jq '.hs | add' <<< "$stats" )"
+			reduce_hashrate_to_khs "$hashrate_raw" "$ASIC_CHAIN_HASHRATE_UNITS" 'total_khs'
+			# shellcheck disable=SC2071
+			# bc of float comparison
+			[[ "$total_khs" > '0' ]] && system_status='mining'
+			(( script_DEBUG )) && debug_print_variable stats
+		;;
+
+		'Blackminer F1'*)
+			# echo '{"command":"stats"}' | timeout -t 7 nc localhost 4028 | tr -d '\0\n'
+			if ! stats_raw="$( get_stats_raw )" || [[ -z "$stats_raw" ]]; then
+				log_line warning "Failed to read $miner_name stats from $miner_API_host:$miner_API_port"
+				{ sanitize_total_khs; return; }
+			fi
+
+			# fix a broken API answer (like S9): '}{' -> '},{'       vvvvvvvvvvv
+			STATS="$( jq --compact-output '.STATS' <<< "${stats_raw//\}\{/\},\{}" )"
+
+			local COIN="$( jq --raw-output '."coin-type"' < /config/cgminer.conf )"
+			POWER=( '50' )
+			if [[ -e /hive/share/blackminer/blackminer.json ]] && BBDATA="$( jq --exit-status '.' < /hive/share/blackminer/blackminer.json )"; then
+					ASIC_ALGO="$( jq --raw-output --arg coin "$COIN" '.[$coin].algo' <<< "$BBDATA" )"	|| error_vars+=( "ASIC_ALGO#$?" )
+					POWER="$( jq --raw-output --arg coin "$COIN" '.[$coin].power' <<< "$BBDATA" )"		|| error_vars+=( "POWER#$?" )
+			fi
+
+			hashrate_raw="$( jq --raw-output '.[1]."GHS 5s"' <<< "$STATS" )" #14162.91 gh/s = 14 th/s
+			reduce_hashrate_to_khs "$hashrate_raw" "$ASIC_CHAIN_HASHRATE_UNITS" 'total_khs'
+			process_pools || { sanitize_total_khs; return; }
+
+			uptime="$(		jq --raw-output		'.[1].Elapsed'																													<<< "$STATS" )" || error_vars+=( "uptime#$?" )
+			hs="$(			jq --compact-output	'.[1]	| with_entries( select(.key | test("chain_rate\\d+")) )	| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "hs#$?" )
+#			temp="$(		jq --compact-output	'.[1]	| with_entries( select(.key | test("temp2_\\d+")) )		| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "temp#$?" )
+			temp="$(		jq --compact-output	'.[1]	| with_entries( select(.key | test("temp\\d+$")) )		| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "temp#$?" )
+			board_temp="$(	jq --compact-output	'.[1]	| with_entries( select(.key | test("temp\\d+$")) )		| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "board_temp#$?" )
+			fan_percent="$(	jq --compact-output --argjson max_fan_rpm "$ASIC_MAX_FAN_RPM" \
+												'.[1]	| with_entries( select(.key | test("fan\\d+")) )		| to_entries | [.[].value / $max_fan_rpm * 100 + 0.5 | floor ]'	<<< "$STATS" )" || error_vars+=( "fan_percent#$?" )
+			fan_rpm="$(		jq --compact-output	'.[1]	| with_entries( select(.key | test("fan\\d+")) )		| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "fan_rpm#$?" )
+			freq="$(		jq --compact-output	'.[1]	| with_entries( select(.key | test("frequency\\d+")) )	| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "freq#$?" )
+			miner_count="$(	jq --compact-output	'.[1]	| with_entries( select(.key | test("miner_count")) )	| to_entries | .[].value'										<<< "$STATS" )" || error_vars+=( "miner_count#$?" )
+			chain_acn="$(	jq --compact-output	'.[1]	| with_entries( select(.key | test("chain_acn\\d+")) )	| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "chain_acn#$?" )
+			chain_acs="$(	jq --compact-output	'.[1]	| with_entries( select(.key | test("chain_acs\\d+")) )	| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "chain_acs#$?" )
+			hw_errors="$(	jq --compact-output	'.[1]	| with_entries( select(.key | test("chain_hw\\d+")) )	| to_entries | [.[].value]'										<<< "$STATS" )" || error_vars+=( "hw_errors#$?" )
+			ar="$(			jq --compact-output --argjson pool "$active_pool_id" \
+								'.[$pool] | with_entries( select(.key | test("^Accepted","^Rejected","Get Failures")) ) | to_entries | [.[].value]'	<<< "$POOLS" )" || error_vars+=( "ar#$?" )
+
+			if [[ "$( jq --raw-output length <<< "$freq" )" -ne "$miner_count" ]]; then
+				freq_new='[]'
+				freq="$(	jq --compact-output	'.[1]	| with_entries( select(.key | test("frequency")) )		| to_entries | [.[].value]'										<<< "$STATS" )"
+				freq_num="$( jq --raw-output '.[0]' <<< "$freq" )"
+				for (( c=1; c<=miner_count; c++ )); do
+					freq_new="$( jq --raw-output --arg freq_num "$freq_num" '[.[], $freq_num | tonumber]' <<< "$freq_new" )"
+				done
 			else
-				#stats_raw=$(sed 's/}{/\},{/' <<< "$stats_raw")
-				local STATS=$(jq '.STATS' <<< "$stats_raw")
-
-				#if [[ -z $algo || $algo == "null" ]]; then
-				#	algo=`echo '{"command":"coin"}' | nc localhost 4028 | jq '.COIN."Hash Method"'`
-				#fi
-
-				local algo=$ASIC_ALGO
-				local hs_units=$HASH
-				local uptime=$(jq -r '.[0].Elapsed' <<< "$STATS")
-				khs=$(cat /tmp/stats.json | jq -r '.[-1] | .[] | add')
-				if [[ $HASH == "mhs" ]]; then
-					khs=$(awk '{print $1 * 1000}' <<< "$khs")
-				elif [[ $HASH == "khs" ]]; then
-					khs=$(awk '{print $1}' <<< "$khs")
-				else
-					khs=$(awk '{print $1 / 1000}' <<< "$khs")
-				fi
-
-				local hs=$(cat /tmp/stats.json | jq -r '[.[-1] | .[] | .[]]')
-				local temp=$(	 (jq '[.[] | with_entries( select(.key | test("^Temp$")) ) 		| to_entries | .[].value]') <<< "$STATS")
-				local fan=$(	 (jq '[.[] | with_entries( select(.key | test("^Fan duty$")) ) 		| to_entries | .[].value]') <<< "$STATS")
-				local freq=$(	 (jq '[.[] | with_entries( select(.key | test("^PLL")) ) 		| to_entries | .[].value]') <<< "$STATS")
-				local acn=$(	 (jq '[.[] | with_entries( select(.key | test("Num chips")) ) 		| to_entries | .[].value]') <<< "$STATS")
-				local status=$(	 (jq '[.[] | with_entries( select(.key | test("Num active chips")) ) 	| to_entries | .[].value]') <<< "$STATS")
-				local hw_errors=$( (jq '[.[] | with_entries( select(.key | test("HW errors")) ) 	| to_entries | [.[].value] | add | select(.!=null)]') <<< "$STATS")
-
-				stats=$(jq -nc \
-						--arg algo "$algo" --argjson hs "$hs" --arg hs_units "$hs_units" \
-						--argjson temp "$temp" --argjson fan "$fan" \
-						--argjson freq "$freq" --argjson acn "$acn" \
-						--argjson hw_errors "$hw_errors" --argjson status "$status" \
-						--arg uptime "$uptime" \
-						'{$algo, $hs, $hs_units, $temp, $fan, $freq, $acn, $hw_errors, $status, $uptime}')
+				freq_new="$freq"
 			fi
+
+			power="$( jq --slurp --compact-output '.' <<< "$POWER" )"
+
+			stats="$( jq --null-input --compact-output																		\
+				--arg		'algo'			"$ASIC_ALGO"					--argjson	'hs'		"${hs:-null}"			\
+				--arg		'hs_units'		"$ASIC_CHAIN_HASHRATE_UNITS"	--argjson	'temp'		"${temp:-null}"			\
+				--argjson	'board_temp'	"${board_temp:-null}"			--argjson	'fan'		"${fan_percent:-null}"	\
+				--argjson	'fan_rpm'		"${fan_rpm:-null}"				--argjson	'freq'		"${freq_new:-null}"		\
+				--argjson	'acn'			"${chain_acn:-null}"			--argjson	'power'		"${power:-null}"		\
+				--argjson	'ar'			"${ar:-null}"					--argjson	'hw_errors'	"${hw_errors:-null}"	\
+				--argjson	'status'		"${chain_acs:-null}"			--argjson	'uptime'	"${uptime:-null}"		\
+																															\
+				'{$algo,$hs,$hs_units,$temp,$board_temp,$fan,$fan_rpm,$freq,$acn,$power,$ar,$hw_errors,$status,$uptime}'	\
+																															\
+				2> /dev/null
+			)" || error_vars+=( "stats#$?" )
+			(( script_DEBUG )) && debug_print_variable stats ASIC_ALGO hs ASIC_CHAIN_HASHRATE_UNITS temp chip_temp board_temp fan_percent fan_rpm freq freq_new chain_voltage chain_acn power hw_errors chain_acs uptime ar asicboost
 		;;
-		"T4.G19")
-			stats_raw=`echo '{"command":"devs"}' | timeout -t 7 nc localhost 4028 | tr -d '\0'`
-			if [[ $? -ne 0 || -z $stats_raw ]]; then
-				echo -e "${YELLOW}Failed to read $miner stats from localhost:4028${NOCOLOR}"
-			else
-				local STATS=$(jq '.DEVS' <<< "$stats_raw")
 
-				#if [[ -z $algo || $algo == "null" ]]; then
-				#	algo=`echo '{"command":"coin"}' | nc localhost 4028 | jq '.COIN."Hash Method"'`
-				#fi
-
-				local algo=$ASIC_ALGO
-				local hs_units=$HASH
-				local uptime=$(jq -r '.[0]["Device Elapsed"]' <<< "$STATS")
-				khs=$(jq -r '[.[]["MHS av"]] | add' <<< "$STATS")
-				if [[ $HASH == "mhs" ]]; then
-					khs=$(awk '{print $1 * 1000}' <<< "$khs")
-				elif [[ $HASH == "khs" ]]; then
-					khs=$(awk '{print $1}' <<< "$khs")
-				else
-					khs=$(awk '{print $1 / 1000}' <<< "$khs")
-				fi
-
-				local hs=$(	 (jq '[.[] | with_entries( select(.key | test("MHS 5s")) ) 		| to_entries | .[].value]') <<< "$STATS")
-				local temp=$(	 (jq '[.[] | with_entries( select(.key | test("TempAVG")) ) 		| to_entries | .[].value]') <<< "$STATS")
-				local freq=$(	 (jq '[.[] | with_entries( select(.key | test("CORE")) ) 		| to_entries | .[].value]') <<< "$STATS")
-				local acn=$(	 (jq '[.[] | with_entries( select(.key | test("DUTY")) ) 		| to_entries | .[].value]') <<< "$STATS")
-#				local status=$(	 (jq '[.[] | with_entries( select(.key | test("Num active chips")) ) 	| to_entries | .[].value]') <<< "$STATS")
-				local hw_errors=$( (jq '[.[] | with_entries( select(.key | test("Hardware Errors")) ) 	| to_entries | .[].value]') <<< "$STATS")
-
-				stats=$(jq -nc \
-						--arg algo "$algo" --argjson hs "$hs" --arg hs_units "$hs_units" \
-						--argjson temp "$temp" \
-						--argjson freq "$freq" --argjson acn "$acn" \
-						--argjson hw_errors "$hw_errors" \
-						--arg uptime "$uptime" \
-						'{$algo, $hs, $hs_units, $temp, $freq, $acn, $hw_errors, $uptime}')
+		'Avalon'*)
+			if ! stats_raw="$( /hive/bin/avalon_api 'status' )" || [[ -z "$stats_raw" ]]; then
+				log_line warning "Failed to get 'status' from Avalon API"
+				{ sanitize_total_khs; return; }
 			fi
+
+			if ! stats_dev_raw="$( /hive/bin/avalon_api 'stats' )" || [[ -z "$stats_dev_raw" ]]; then
+				log_line warning "Failed to get 'stats' from Avalon API"
+			fi
+
+			STATS="$(			jq --compact-output '.summary'	<<< "$stats_raw" )"		|| error_vars+=( "STATS#$?" )
+#			STATS_DEV="$(		jq --compact-output '.stats'	<<< "$stats_dev_raw" )"	|| error_vars+=( "STATS_DEV#$?" )
+			STATS_DEV="$(		jq --compact-output				<<< "$stats_dev_raw" )"	|| error_vars+=( "STATS_DEV#$?" )
+
+			hashrate_raw="$(	jq --raw-output '[.["MHS av"]] | add' <<< "$STATS" )"	|| error_vars+=( "hashrate_raw#$?" )
+			reduce_hashrate_to_khs "$hashrate_raw" "$ASIC_CHAIN_HASHRATE_UNITS" 'total_khs'
+
+			uptime="$(			jq --raw-output		'.["Elapsed"]'																						<<< "$STATS" )"		|| error_vars+=( "uptime#$?" )
+			hs="$(				jq --compact-output	'[. | with_entries( select(.key | test("MHS 5s")) )						| to_entries | .[].value]'	<<< "$STATS" )"		|| error_vars+=( "hs#$?" )
+			temp="$(			jq --compact-output	'[.stats["0"] | with_entries( select(.key | test("AUC Temperature")) )	| to_entries | .[].value]'	<<< "$STATS_DEV" )"	|| error_vars+=( "temp#$?" )
+			freq="$(			jq --compact-output	'[.[][][]."Freq" | with_entries( select(.key | test("CORE")) )			| to_entries | .[].value]'	<<< "$STATS_DEV" )"	|| error_vars+=( "freq#$?" )
+#			chain_acn="$(		jq --compact-output	'[. | with_entries( select(.key | test("DUTY")) )						| to_entries | .[].value]'	<<< "$STATS" )"		|| error_vars+=( "chain_acn#$?" )
+#			chain_acs="$(		jq --compact-output	'[. | with_entries( select(.key | test("Num active chips")) )			| to_entries | .[].value]'	<<< "$STATS" )"		|| error_vars+=( "chain_acs#$?" )
+			hw_errors="$(		jq --compact-output	'[. | with_entries( select(.key | test("Hardware Errors")) )			| to_entries | .[].value]'	<<< "$STATS" )"		|| error_vars+=( "hw_errors#$?" )
+
+			stats="$( jq --null-input --compact-output																		\
+				--arg		'algo'			"$ASIC_ALGO"					--argjson	'hs'		"${hs:-null}"			\
+				--arg		'hs_units'		"$ASIC_CHAIN_HASHRATE_UNITS"	--argjson	'temp'		"${temp:-null}"			\
+				--argjson	'freq'			"${freq:-null}"																	\
+				--argjson	'hw_errors'		"${hw_errors:-null}"			--argjson	'uptime'	"${uptime:-null}"		\
+																															\
+				'{$algo, $hs, $hs_units, $temp, $freq, $hw_errors, $uptime}'												\
+																															\
+				2> /dev/null
+			)" || error_vars+=( "stats#$?" )
+			(( script_DEBUG )) && debug_print_variable stats ASIC_ALGO hs ASIC_CHAIN_HASHRATE_UNITS temp chip_temp board_temp fan_percent fan_rpm freq freq_new chain_voltage chain_acn power hw_errors chain_acs uptime ar asicboost
 		;;
+
 		*)
-			miner="unknown"
-			#MINER=miner
-			eval "MINER${mindex}=unknown"
+			errcho "Unsupported ASIC model '$ASIC_MODEL'"
+			MINER='unknown'
 		;;
 	esac
 
+	{ sanitize_total_khs; return; }
+}
 
-	[[ -z $khs ]] && khs=0
-	[[ -z $stats ]] && stats="null"
+function get_loadavg_as_json_array {
+	# vars
+	local LA_1m LA_5m LA_15m
 
-#	[[ ! -z $mindex ]] &&
-#		eval "khs${mindex}"
+	# code
+	# /proc/loadavg: '1.24 1.25 1.34 3/251 5135'
+	read -t 10 -r LA_1m LA_5m LA_15m _ < /proc/loadavg
+	printf '[%0.1f,%0.1f,%0.1f]\n' "$LA_1m" "$LA_5m" "$LA_15m"
+}
+
+function get_diskfree_as_string {
+	# arrays
+	local -a lines_array last_line_array
+
+	# vars
+	local diskfree
+
+	# code
+	#df -h "/${ASIC_MOUNT_PATH}" | awk '{ print $4 }' | tail -n 1 | sed 's/%//'
+	readarray -s 1 -t lines_array < <( df -h "/${ASIC_MOUNT_PATH}" )
+	last_line_array=( ${lines_array[-1]} )
+	diskfree="${last_line_array[3]/%%}"
+
+	echo "$diskfree"
+}
+
+function get_mem_as_json_array {
+	# vars
+	local meminfo_parameter_field meminfo_size_field
+	local -i MemTotal=-1 MemAvailable=-1
+
+	# flags
+	local -i is_both_parameters_read_ok_FLAG=0
+
+	# code
+	#MemTotal:        8074824 kB
+	#MemFree:         5573512 kB
+	#MemAvailable:    5697504 kB
+	#Buffers:           51764 kB
+	while read -t 10 -r meminfo_parameter_field meminfo_size_field _ || [[ -n "$meminfo_parameter_field" ]]; do
+		[[ "$meminfo_parameter_field" == 'MemTotal:' ]] && (( MemTotal = meminfo_size_field ))
+		[[ "$meminfo_parameter_field" == 'MemAvailable:' ]] && (( MemAvailable = meminfo_size_field ))
+		if (( MemTotal != -1 && MemAvailable != -1 )); then
+			is_both_parameters_read_ok_FLAG=1
+			break
+		fi
+	done < /proc/meminfo
+
+	if (( is_both_parameters_read_ok_FLAG )); then
+		echo "[$(( MemTotal / 1024 )),$(( MemAvailable / 1024 ))]"
+	else
+		echo 'null'
+	fi
+}
+
+function get_saved_last_cmd_id {
+	# vars
+	local saved_last_cmd_id
+
+	# code
+	if [[ -s "$last_cmd_id_FILE" ]]; then
+		saved_last_cmd_id="$( < "$last_cmd_id_FILE" )"
+		(( script_DEBUG )) && log_line debug "[DEBUG] $last_cmd_id_FILE content is $saved_last_cmd_id" 1>&2 # TODO modify library to bear this redirection
+	else
+		saved_last_cmd_id=''
+	fi
+
+	(( script_DEBUG )) && log_line debug "[DEBUG] saved_last_cmd_id is '$saved_last_cmd_id'" 1>&2
+	echo "$saved_last_cmd_id"
 }
 
 
@@ -341,11 +479,8 @@ loop () {
 
 	echo -en "Hashrate ${CYAN}$MINER${NOCOLOR} `[[ $khs > 0 ]] && echo -e ${YELLOW} || echo -e ${RED}`$khs${NOCOLOR} kH/s"
 	echo -en "\n"
-	if [ -d /run/ ]; then
-		echo $khs > /run/hive/khs
-	else
-		echo $khs > /tmp/khs
-	fi
+	echo $khs > /run/hive/khs
+
 
 	#echo $stats
 	#uptime: load averages for the past 1, 5, and 15 minutes
@@ -371,236 +506,1008 @@ loop () {
 	}'
 	)
 
-	echo $request | jq '.' -c
+	# jq's failover (like in the case of the broken jq or like)
+	if [[ $? -ne 0 || -z "$request" ]]; then
+		log_line error 'Something went wrong while constructing a JSON request. Engaging a failback mode...'
+		debug_print_variable 'RIG_ID' 'last_cmd_id' 'META' 'stats' 'total_khs' 'avg_khs' 'cpuavg'
+		# good ol' bash string assembly
+		request="{\"method\":\"stats\",\"jsonrpc\":\"2.0\",\"id\":0,\"params\":{\"rig_id\":${RIG_ID},\"passwd\":\"${RIG_PASSWD}\",\"miner\":\"$MINER\",\"system_status\":\"$system_status\"}}"
+	fi
 
-	if [[ -z $RIG_ID ]]; then
-		echo -e "${YELLOW}No RIG_ID, skipping sending stats${NOCOLOR}"
+	# show the request, password cloaked
+	jq '.params.passwd=$cloaked_pass' --arg cloaked_pass "${RIG_PASSWD//?/*}" --compact-output <<< "$request"
+
+	if [[ -z "$RIG_ID" ]]; then
+		log_line warning "No RIG_ID, sending stats skipped"
 		return
 	fi
 
-	#log request
-	echo "[`date`] > `echo $request | jq '.' -c`" >> $LOG
-	#echo "[`date`] > $request" >> $LOG
 
-	response=$(echo $request | curl --insecure -L --data @- \
-	--connect-timeout 15 --max-time 25 --silent \
-	-XPOST "${HIVE_URL}?id_rig=$RIG_ID&method=stats"  -H "Content-Type: application/json")
-
-	exitcode=$?
-	if [[ "$exitcode" -ne 0 || -z "$response" ]]; then
-		echo -e "${RED}Error sending stats${NOCOLOR} $HIVE_HOST_URL" && human-curl-error $exitcode
-		echo "[`date`] < ERROR SENDING STATS TO $HIVE_HOST_URL (curl code=$exitcode) \"$response\"" >> $LOG
-		/hive/bin/cache-hive-ip
-		return $exitcode
+	# !!! and now the duct tape
+	# !!! fix /hive/bin/message then ditch this under the bus
+	# protection measures -- we don't have https on the vast majority of ASICs
+	if [[ "$HIVE_HOST_URL" == 'https://'* ]]; then
+		log_line warning "Secure connection to $HIVE_HOST_URL is not supported, most likely"
+		if (( ! https_disabled_message_sent_FLAG )) && (( ! is_https_allowed_FLAG )); then
+			cp "$RIG_CONF" "${RIG_CONF}.original"
+			sed -i 's|HIVE_HOST_URL="https://|HIVE_HOST_URL="http://|' "$RIG_CONF"
+			message warning "Server URL with HTTPS might not be supported on this ASIC. It's recommended to switch to HTTP (Settings->Mirror select)" --silent
+			mv "${RIG_CONF}.original" "$RIG_CONF"
+			https_disabled_message_sent_FLAG=1
+		fi
 	fi
 
-	#echo $response
-	#echo "[`date`] < `echo $response | jq '.' -c`" >> $LOG
-	echo "[`date`] < $response" >> $LOG #full response even invalid
+	until (( is_server_push_went_ok_FLAG )); do
 
-	error=$(echo $response | jq '.error' --raw-output)
-	[[ $? != 0 ]] && echo -e "${RED}Invalid response${NOCOLOR}: $HIVE_HOST_URL\n$response" && return 1
-	[[ ! -z "$error" && "$error" != "null" ]] && echo -e "${RED}Error response${NOCOLOR}: $error" && return 1
+log_line debug 'push start'
 
-	command=$(echo $response | jq '.result.command' --raw-output)
+		if (( is_failover_connection_in_force_FLAG )); then
+log_line debug 'failover check'
+			# check for a failover mode's age
+			set_variable_to_current_system_time_in_seconds 'the_now'
+			((
+				seconds_passed_since_failover_connection = the_now - time_start_failover_connection,
+				seconds_left_till_switch_to_main = failover_connection_duration_in_s_DEFAULT - seconds_passed_since_failover_connection
+			))
+			if (( seconds_left_till_switch_to_main <= 0 )); then
+				# return to the main host
+				is_failover_connection_in_force_FLAG=0
+				is_api_host_file_relevant_FLAG=0
+				API_HOST_URLs_working_collection_index=0
+				log_line warning "It's time to switch back to the main API server"
+			fi
+		fi
+log_line debug 'oob check'
 
-	[[ "$command" != "OK" ]] && echo "$response" | jq '.result'
+		# out of boundaries check
+		if (( API_HOST_URLs_working_collection_index >= API_HOST_URLs_working_collection_size )); then
+			if (( ! is_failover_connection_in_force_FLAG )); then
+				API_HOST_URLs_working_collection_index=0 # use main api host
+			else
+				API_HOST_URLs_working_collection_index=1
+			fi
+		fi
+log_line debug 'api host check'
+
+		# set working API host
+		API_HOST_URL_current="${API_HOST_URLs_working_collection[API_HOST_URLs_working_collection_index]%/}" # cut the trailing slash in host URL, if any (like as in rocketchain's local API server URL)
+
+log_line debug 'whitelabel check'
+
+		# whitelabel's workaround
+		if [[ "$API_HOST_URL_main" != *'hiveos.farm'* && "$API_HOST_URL_current" == *'hiveos.farm'* ]]; then
+			log_line warning "Whitelabel detected, sending stats to $API_HOST_URL_current skipped..."
+			(( API_HOST_URLs_working_collection_index++ )) # iterate to the next host
+			continue # start over
+		fi
+
+		# calculate and show upstream communication quality
+		(( push_total_counter++ ))
+		if (( push_bad_counter > 0 )); then
+log_line debug 'comm_quality check'
+			comm_quality_percentage="$( calculate_quality "$push_bad_counter" "$push_total_counter" )"
+			# and here comes some fancy optimization
+			(( push_bad_counter < 1000 ))	&& push_bad_counter_humanized="$push_bad_counter"		|| push_bad_counter_humanized="$( humanize "$push_bad_counter" )"
+			(( push_total_counter < 1000 ))	&& push_total_counter_humanized="$push_total_counter"	|| push_total_counter_humanized="$( humanize "$push_total_counter" )"
+			# finally, then:
+			log_line warning "Upstream communication quality ${comm_quality_percentage}% ($push_bad_counter_humanized unsuccessful out of $push_total_counter_humanized)"
+		fi
+
+log_line debug 'is_failover_connection_in_force check'
+
+		if (( is_failover_connection_in_force_FLAG )); then
+			log_line warning "Failover API server is active, $( seconds2dhms "$seconds_left_till_switch_to_main" ) till returning to main"
+			log_line info "API servers: $( pretty_print_api_hosts "${API_HOST_URLs_working_collection[*]}" "$API_HOST_URLs_working_collection_index" )"
+		fi
+
+		log_line info "Sending stats (${#request} bytes) to ${API_HOST_URL_current}..."
+
+		request_endpoint="${API_HOST_URL_current}/worker/api?id_rig=${RIG_ID}&method=stats"
+		time_start_sending_stats="$( get_system_uptime_in_milliseconds )"
+		response="$(
+			${curl_protocol}									\
+																\
+				--location --data @- --silent					\
+																\
+				--header 'Content-Type: application/json'		\
+				--request POST "$request_endpoint"				\
+																\
+				--connect-timeout "$curl_connect_timeout"		\
+				--max-time "$curl_max_time"						\
+																\
+				--verbose										\
+				--trace-time									\
+				--fail											\
+																\
+			<<< "$request" 2> "$latest_curl_log"
+		)"
+		curl_exitcode=$?
+		time_wasted_sending_stats_in_s="$( get_time_difference_in_s $(( time_start_sending_stats )) )"
+log_line debug 'curl exit'
+
+		if (( curl_exitcode == 0 )); then
+			is_server_push_went_ok_FLAG=1
+			# a one-time write if connection was successful (or the file does not exist)
+			if (( ! is_api_host_file_relevant_FLAG )) || [[ ! -s "$API_HOST_FILE" ]]; then
+				if echo "HIVE_HOST_URL=\"$API_HOST_URL_current\"" > "$API_HOST_FILE"; then
+					is_api_host_file_relevant_FLAG=1
+				fi
+			fi
+		else
+			(( push_bad_counter++ ))
+			is_api_host_file_relevant_FLAG=0
+
+			log_line error "Error sending stats with exitcode $curl_exitcode in ${WHITE}${time_wasted_sending_stats_in_s}s${NOCOLOR}. Connection log:"
+
+			if [[ -s "$latest_curl_log" ]]; then
+				# pretty-print the log with indentation
+				readarray -t latest_curl_log_as_array < "$latest_curl_log"
+				printf '%b' "${DGRAY-}"
+				#       yyyy-mm-dd
+				printf '           %s\n' "${latest_curl_log_as_array[@]}"
+				printf '%b' "${NOCOLOR-}"
+			fi
+
+			if (( API_HOST_URLs_working_collection_index == 0 )); then
+				set_variable_to_current_system_time_in_seconds 'time_start_failover_connection'
+				is_failover_connection_in_force_FLAG=1
+				log_line warning 'Main API server is not available, switching to the failover one'
+			else
+				log_line warning 'This failover API server is not available, switching to the next one'
+			fi
+			(( API_HOST_URLs_working_collection_index++ )) # iterate to the next host
+
+			sleep_with_progress_bar $(( current_push_interval / 2 )) # a kind of brother's mercy to the network and local router
+		fi
+	done
+
+#	if [[ $curl_exitcode -ne 0 || -z "$response" ]]; then
+#		log_line error "No luck. Let's refresh the IP cache..."
+#		/hive/bin/timeout -t 10 /hive/bin/cache-hive-ip
+#		return "$curl_exitcode"
+#	fi
+
+	# errors processing
+	local error
+	#
+	if ! error="$( jq --raw-output '.error' <<< "$response" )"; then
+		log_line error "Invalid response received in ${WHITE}${time_wasted_sending_stats_in_s}s${NOCOLOR}:\n$response"
+		return 1
+	fi
+
+	if is_JSON_string_not_empty_or_null "$error"; then
+		log_line error "Error response received in ${WHITE}${time_wasted_sending_stats_in_s}s${NOCOLOR}: $error"
+		return 1
+	fi
 
 
-	if [[ "$command" != "batch" ]]; then
-		body=`echo $response | jq -c '.result'`
+	# command processing
+	local command
+	#
+	command="$( jq --raw-output '.result.command' <<< "$response" )"
+	if [[ "$command" == 'OK' ]]; then
+		if [[ -f "$last_cmd_id_FILE" ]]; then
+			(( script_DEBUG )) && log_line debug "[DEBUG] removing $last_cmd_id_FILE"
+			rm "$last_cmd_id_FILE"
+		fi
+	else
+		local response_stripped="${response//\\n/\\\\n}" # neuter the \n's
+		log_line info "Server answer: $( jq --compact-output --color-output '.result' <<< "$response_stripped" )"
+		skip_the_sleep_FLAG=1
+	fi
+
+
+	# confseq processing
+	local confseq_received confseq_saved
+	#
+	confseq_received="$( jq --raw-output '.result.confseq' <<< "$response" )"
+	if is_JSON_string_not_empty_or_null "$confseq_received"; then
+		if [[ -s "$confseq_FILE" ]]; then
+			confseq_saved="$( < "$confseq_FILE" )"
+		else
+			# first time run, just save current confseq
+			confseq_saved="$confseq_received"
+			echo "$confseq_received" > "$confseq_FILE"
+		fi
+
+		if (( confseq_saved != confseq_received )); then
+			# save updated confseq
+			echo "$confseq_received" > "$confseq_FILE"
+			case "$command" in
+				'config' | 'wallet' | 'asic_oc' | 'asic' )
+					log_line debug "[DEBUG] config command received. Config sequence updated: $confseq_saved -> $confseq_received"
+				;;
+				*)
+					log_line debug "[DEBUG] no config command received, but config sequence updated: $confseq_saved -> $confseq_received. Let's say hello again..." # (and then get an updated config)
+					hello # TODO fork to bg?
+				;;
+			esac
+		fi
+	else
+		(( script_DEBUG )) && log_line debug "[DEBUG] server answer lacks 'confseq' key, confseq processing skipped"
+	fi
+
+
+	# to batch or not to batch
+	local body
+	local -i commands_count this_command_index
+	#
+	if [[ "$command" != 'batch' ]]; then
+		body="$( jq --compact-output '.result' <<< "$response" )"
 		do_command
 	else
-		count=`echo $response | jq '.result.commands|length'`
-		echo "Got $count batch commands"
-		for (( i=0; i < $count; i++ )); do
-			body=`echo $response | jq -c ".result.commands[$i]"`
-			command=
+		commands_count="$( jq '.result.commands | length' <<< "$response" )"
+		log_line info "Got $commands_count batch commands"
+		for (( this_command_index = 0; this_command_index < commands_count; this_command_index++ )); do
+			body="$( jq --compact-output --argjson index "$this_command_index" '.result.commands[$index]' <<< "$response" )"
+			command="$( jq --raw-output '.command' <<< "$body" )" # get command for batch
 			do_command
 		done
 	fi
 }
 
+function decloak_string {
+	#
+	# a way to render all this escape-golfing to a plain text
+	#
 
-########################################################################################################################
+	# args
+	local -r string_to_decloak="${1-}"
 
+	# vars
+	local string_with_blanks_deduplicated string_unescaped
 
-do_command () {
-	#body=$1
-	[[ -z "$command" ]] && command=`echo $body | jq -r '.command'` #get command for batch
+	# asserts
+	[[ -n "$string_to_decloak" ]] || return 0 # empty is ok
 
-	#Optional command identifier
-	cmd_id=$(echo "$body" | jq -r '.id')
-	[[ $cmd_id == "null" ]] && cmd_id=
+	# code
+	printf -v string_unescaped '%b' "$string_to_decloak"  # 1. render ESCapes
+	string_with_blanks_deduplicated="${string_unescaped//+([[:blank:]])/ }" # 2. compress blanks
+	echo "$string_with_blanks_deduplicated"
+}
 
-	case $command in
-		OK)
-			echo -e "${BGREEN}$command${NOCOLOR}"
+shopt -s extglob # this is needed for the bash parser to properly parse a code block (function is also a code block) that contains any extglob syntax
+function is_allowed_cmd {
+	# args
+	local cmd_to_test="${1-}"
+
+	# vars
+	local reason_message='undefined' cmd_to_test_decloaked
+
+	# flags
+	local -i reason_index=1
+
+	# asserts
+	[[ -n "$cmd_to_test" ]] || return 0 # empty is ok
+
+	# code
+	shopt -s extglob
+
+	cmd_to_test_decloaked="$( decloak_string "$cmd_to_test" )"
+	case "$cmd_to_test_decloaked" in
+		!(*.)'sh '*)
+			reason_index=1
+			reason_message='Illegal execution of shell'
 		;;
-		reboot)
-			message ok "Rebooting" --id=$cmd_id
-			echo -e "${BRED}Rebooting${NOCOLOR}"
-			#nohup bash -c 'sreboot' > /tmp/nohup.log 2>&1 &
+
+		*'|'?( )?(ba|da|a)'sh'*)
+			reason_index=2
+			reason_message='Illegal pipe to shell'
+		;;
+
+		*'chmod'* | *'curl'* | *'wget'* | *'source'* | *'dropbear'* | *'perl'* | *'nc '*)
+			reason_index=3
+			reason_message='Illegal command'
+		;;
+
+		*'$'*)
+			reason_index=4
+			reason_message='Illegal $VAR use'
+		;;
+
+		'')
+			reason_index=0
+			reason_message='Ok (empty)'
+		;;
+
+		*)
+			reason_index=0
+			reason_message='Ok'
+		;;
+	esac
+	shopt -u extglob
+
+	echo "$reason_message"
+	return $(( reason_index ))
+}
+shopt -u extglob # turn it off, as in the default state
+
+function do_command {
+	# consts
+	local -r command_log="/tmp/${script_basename}-${command// /-}.log"
+
+	# vars
+	local cmd_id client_version asic_oc firmware_url
+	local config justwrite line NEW_PASSWD request response error wallet
+	local request_endpoint
+	local -i curl_exitcode
+	#local TMUX	# let's test it later
+
+	# code
+#	[[ -z "$command" ]] && command="$( jq --raw-output '.command' <<< "$body" )" #get command for batch
+
+	# cmd_id processing (optional command identifier)
+	cmd_id="$( jq --raw-output '.id' <<< "$body" )"
+	is_JSON_string_empty_or_null "$cmd_id" && cmd_id=''
+	# save last cmd_id
+	(( script_DEBUG )) && log_line debug "[DEBUG] incoming cmd_id is '$cmd_id'"
+	if (( cmd_id > 0 )); then
+		(( script_DEBUG )) && log_line debug "[DEBUG] saving cmd_id '$cmd_id' to $last_cmd_id_FILE"
+		echo "$cmd_id" > "$last_cmd_id_FILE"
+	fi
+
+	log_line ok "'$command' received in ${WHITE}${time_wasted_sending_stats_in_s}s"
+
+	# consult a blacklist
+	if [[ "$ASIC_MODEL" == 'Avalon'* ]]; then
+		forbidden_commands_RE='^(asic|exec|firmware-upgrade)$'
+		if [[ "$command" =~ $forbidden_commands_RE ]]; then
+			log_line warning "'$command' is forbidden for this firmware"
+			message warning "Command '$command' is forbidden for this firmware" --id="$cmd_id" --silent
+			return
+		fi
+	fi
+
+	case "$command" in
+		'OK')
+			# do nothing
+			:
+		;;
+
+		'reboot')
+			message ok 'Rebooting' --id="$cmd_id" --silent
+			log_line ok 'Rebooting'
 			/sbin/reboot
 		;;
-		upgrade)
+
+		'upgrade')
+			client_version="$( jq --raw-output '.version' <<< "$body" )"
+			is_JSON_string_empty_or_null "$client_version" && client_version=''
 			screen -dm -S selfupgrade bash -c '
-				selfupgrade 2>&1 | tee /tmp/nohup.log
-				upgrade_exitcode=${PIPESTATUS[0]}
-				payload=`cat /tmp/nohup.log`
-				[[ $upgrade_exitcode -eq 0 ]] &&
-					echo "$payload" | message ok "Selfupgrade successful" payload --id='$cmd_id' ||
-					echo "$payload" | message error "Selfupgrade failed" payload --id='$cmd_id'
+				selfupgrade '"$client_version"' |& tee '"$command_log"'
+				if (( PIPESTATUS[0] == 0 )); then
+					message ok "Client update successful" --payload --id='"$cmd_id"' --silent < '"$command_log"'
+				else
+					message error "Client update failed" --payload --id='"$cmd_id"' --silent < '"$command_log"'
+				fi
 			'
 		;;
-		"upgrade beta")
+
+		'upgrade beta')
 			screen -dm -S selfupgrade bash -c '
-				cd /tmp && curl -L --insecure -s -O https://raw.githubusercontent.com/minershive/hiveos-asic/master/hive/bin/selfupgrade && sh selfupgrade 2>&1 | tee /tmp/nohup.log
-				upgrade_exitcode=${PIPESTATUS[0]}
-				payload=`cat /tmp/nohup.log`
-				[[ $upgrade_exitcode -eq 0 ]] &&
-					echo "$payload" | message ok "Selfupgrade successful" payload --id='$cmd_id' ||
-					echo "$payload" | message error "Selfupgrade failed" payload --id='$cmd_id'
+				selfupgrade master |& tee '"$command_log"'
+				if (( PIPESTATUS[0] == 0 )); then
+					message ok "Client update successful" --payload --id='"$cmd_id"' --silent < '"$command_log"'
+				else
+					message error "Client update failed" --payload --id='"$cmd_id"' --silent < '"$command_log"'
+				fi
 			'
 		;;
-		exec)
-			exec=$(echo $body | jq '.exec' --raw-output)
-			if [[ $ASIC_MODEL == "Zig Z1+" ]]; then
-				payload=`timeout 360 bash -c "$exec" 2>&1`
+
+		'exec')
+			local exec_command shutdown_fuse_file
+
+			exec_command="$( jq --raw-output '.exec' <<< "$body" )"
+
+			# let's inform the user that the command is received
+			#message default "$exec_command (running, id: $cmd_id)" --id="$cmd_id" --verbose
+
+			case "$exec_command" in
+				'hssh start' | 'hssh start debug' | 'hssh restart' | 'hssh stop')
+					unset TMUX # !!! a duct tape for HSSH to start
+				;;
+				'sreboot shutdown')
+					shutdown_fuse_file="/tmp/${script_basename}-shutdown-fuse.lock"
+					if [[ ! -f "$shutdown_fuse_file" ]]; then
+						message warning 'Vast majority of ASICs does not support shutdown. Click for details' --payload --id="$cmd_id" --silent <<-EOF
+							<h3>Vast majority of ASICs does not support shutdown</h3>It might be the ASIC will simply go offline. You will more than likely have to power it off manually.
+							If you know what are you doing, please <strong>send this command one more time</strong>
+							EOF
+						touch "$shutdown_fuse_file"
+						return
+					else
+						rm "$shutdown_fuse_file"
+						message ok 'ASIC powered off' --id="$cmd_id" --silent
+						snore 5 # wait 5s until the message has been sent
+					fi
+				;;
+				*)
+					# TMP F-words blocklist
+					test_message="$( is_allowed_cmd "$exec_command" )"; test_code=$?
+					if (( test_code > 0 )); then
+						log_line warning "$test_message. A potentially malicious command received, let's do nothing"
+						message error "$exec_command (failed, exitcode $(( 255 + test_code )))" --escape-templates --id="$cmd_id" --silent
+						return
+					fi
+				;;
+			esac
+
+			local -i exec_time_limit=0
+			local exec_timeout timeout_app=''
+			local exec_screen_name="exec-${cmd_id}-screen"
+			local exec_log="/tmp/${exec_screen_name}.log"
+			local exec_accessory_script="/run/hive/${exec_screen_name}.sh"
+
+			if [[ "${exec_command:0:2}" == ':;' || "$exec_command" == 'hssh start' ]]; then
+				# !!! a secret spell: if the command to exec is prefixed with ':;', then no time limit will be imposed
+				# !!! also no timeout for HSSH
+				:
 			else
-				payload=`timeout -t 360 bash -c "$exec" 2>&1`
+				(( exec_time_limit = 60 * 60 * 3 )) # 3 hrs tops
+				# shellcheck disable=SC2076
+				if [[ "$ASIC_MODEL" == 'Zig Z1' || "$ASIC_MODEL" == 'Zig Z1+' || "$ASIC_MODEL" == 'Toddminer C1'* ]]; then
+					# use Debian /usr/bin/timeout
+					timeout_app='timeout'
+				else
+					# use a BusyBox one OR our own
+					timeout_app='timeout -t'
+				fi
 			fi
-			exitcode=$?
-			echo "$payload"
-			[[ $exitcode -eq 0 ]] &&
-				echo "$payload" | message info "$exec" payload --id=$cmd_id ||
-				echo "$payload" | message error "Exec failed, exitcode=$exitcode" payload --id=$cmd_id
+
+			# a new way thru the gnu screen
+			if touch "$exec_accessory_script" && touch "$exec_log"; then
+				# generate a temporary script
+				# shellcheck disable=SC2016
+				echo '#!/hive/sbin/bash
+					# args
+					declare -r exec_command="$1"
+					declare -r exec_log="$2"
+					declare -r cmd_id="$3"
+					declare -r timeout_app="$4"
+					declare -r exec_time_limit="$5"
+
+					# vars
+					declare -i exec_exitcode
+
+					# code
+					echo "# $exec_command"
+					echo
+					if (( exec_time_limit == 0 )); then
+						$exec_command 0<&- |& tee "$exec_log"
+					else
+						$timeout_app "$exec_time_limit" bash -c "$exec_command" 0<&- |& tee "$exec_log"
+					fi
+					exec_exitcode="${PIPESTATUS[0]}"
+					case "$exec_exitcode" in
+						0)		message info "$exec_command" --escape-templates --id="$cmd_id" --silent --payload < "$exec_log"													;;
+						127)	message error "$exec_command (command not found? exitcode $exec_exitcode)" --escape-templates --id="$cmd_id" --silent --payload < "$exec_log"	;;
+						*)		message error "$exec_command (failed, exitcode $exec_exitcode)" --escape-templates --id="$cmd_id" --silent --payload < "$exec_log"				;;
+					esac
+					rm "$0" "$exec_log"
+				' > "$exec_accessory_script"
+
+				# run this temporary script in a screen
+				chmod +x "$exec_accessory_script"
+				screen -dm -S "$exec_screen_name" "$exec_accessory_script" "$exec_command" "$exec_log" "$cmd_id" "$timeout_app" "$exec_time_limit"
+			else
+				# better be safe than sorry
+				# execute a command in a such way just in the case of a read-only fs or anything weird
+				# here's a file-less approach thru pipe:
+				if (( exec_time_limit == 0 )); then
+					exec_timeout='bash -c' # no time limit at all
+				else
+					exec_timeout="$timeout_app $exec_time_limit bash -c"
+				fi
+
+				# shellcheck disable=SC2016
+				$exec_timeout '
+					exec_output=$( '"$exec_command"' )
+					exec_exitcode="$?"
+					if (( exec_exitcode == 0 )); then
+						echo "$exec_output" | message info "$0" --escape-templates --id="$1" --silent --payload
+					else
+						echo "$exec_output" | message error "$0 (failed, exitcode $exec_exitcode)" --escape-templates --id="$1" --silent --payload
+					fi
+				' "$exec_command" "$cmd_id" & disown
+			fi
 		;;
-		asic_oc)
-			export asic_oc=`echo $body | jq '.asic_oc' --raw-output`
-			screen -dm -S autotune bash -c '
-				asic_oc $asic_oc 2>&1 | tee /tmp/nohup.log
-				exitcode=${PIPESTATUS[0]}
-				payload=`cat /tmp/nohup.log`
-					[[ $exitcode -eq 0 ]] &&
-					echo "$payload" | message ok "Overclock config successful" payload --id='$cmd_id' ||
-					echo "$payload" | message error "Overclock config failed" payload --id='$cmd_id'
+
+		'asic_oc')
+			if is_screen_session_exist "$command"; then
+				screen_session_terminate "$command"
+				log_line warning "Command '$command' already running. Terminated."
+				snore 5
+			fi
+			export asic_oc="$( jq --raw-output '.asic_oc' <<< "$body" )"
+			[[ -f /config/use-new-asic-oc ]] && mv /config/use-new-asic-oc /hive-config/use-new-asic-oc # adjusting legacy location to an actual one
+
+			# choose the right OC script
+			local -i use_new_asic_oc_FLAG=0 # default to old
+			if [[ "$ASIC_MODEL" == 'Antminer L3+'* || "$ASIC_MODEL" == 'Antminer S9'* || "$ASIC_MODEL" == 'Antminer T9+'* || "$ASIC_MODEL" == 'Antminer S10'* ]] && is_version "$ASIC_CUSTOM_FW_VERSION" '>=' '1.02'; then
+				use_new_asic_oc_FLAG=1
+			elif [[ "$ASIC_MODEL" == 'Avalon'* ]]; then
+				use_new_asic_oc_FLAG=1
+			elif is_version "$ASIC_CUSTOM_FW_VERSION" '>=' '2.0'; then
+				# that means Series 17 version range atm
+				use_new_asic_oc_FLAG=1
+			elif [[ "$ASIC_MODEL" == 'Antminer S19'* || "$ASIC_MODEL" == 'Antminer T19'* ]]; then
+				use_new_asic_oc_FLAG=1
+			elif [[ -f /hive-config/use-new-asic-oc ]]; then
+				#      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here comes a secret feature: forced new OC script for any model
+				use_new_asic_oc_FLAG=1
+			fi
+
+			if (( use_new_asic_oc_FLAG )); then
+				asic_oc_cmd='asic-oc'
+			else
+				asic_oc_cmd='asic_oc' # almost deprecated script, left for compatibility with legacy FW
+			fi
+
+			screen -dm -S "$command" bash -c '
+				echo "Auto-tune parameters:"
+				echo
+				jq "." <<< "$asic_oc"
+				echo
+				'"$asic_oc_cmd"' "$asic_oc" |& tee '"$command_log"'
+				if (( PIPESTATUS[0] == 0 )); then
+					message ok "Auto-tune is finished. Click for details" --payload --id='"$cmd_id"' --silent < '"$command_log"'
+				else
+					message error "Auto-tune error. Click for details" --payload --id='"$cmd_id"' --silent < '"$command_log"'
+				fi
 			'
 		;;
-		firmware-upgrade)
-			export firmware_url=`echo $body | jq '.firmware_url' --raw-output`
-			screen -dm -S upgade bash -c '
-				firmware-upgrade $firmware_url 2>&1 | tee /tmp/nohup.log
-				exitcode=${PIPESTATUS[0]}
-				payload=`cat /tmp/nohup.log`
-					[[ $exitcode -eq 0 ]] &&
-					echo "$payload" | message ok "Firmware upgrade successful, rebooting..." payload --id='$cmd_id' ||
-					echo "$payload" | message error "Firmware upgrade failed" payload --id='$cmd_id'
+
+		'firmware-upgrade')
+			if is_screen_session_exist "$command"; then
+				log_line warning "Command '$command' already running. Execution skipped."
+				message warning "Firmware upgrade skipped. Click for details" --payload --id="$cmd_id" --silent <<< "Previous firmware upgrade process is still running. Please wait for it to finish and then send the command again."
+				return
+			fi
+			export firmware_url="$( jq --raw-output '.firmware_url' <<< "$body" )"
+			screen -dm -S "$command" bash -c '
+				firmware-upgrade "$firmware_url" |& tee '"$command_log"'
+				if (( PIPESTATUS[0] == 0 )); then
+					message ok "Firmware upgrade successful, rebooting..." --payload --id='"$cmd_id"' --silent < '"$command_log"'
+				else
+					message error "Firmware upgrade failed" --payload --id='"$cmd_id"' --silent < '"$command_log"'
+				fi
 			'
 		;;
-		config)
-			config=$(echo $body | jq '.config' --raw-output)
-			justwrite=$(echo $body | jq '.justwrite' --raw-output) #don't restart miner, just write config, maybe WD settings will be updated
-			if [[ ! -z $config && $config != "null" ]]; then
-				#scan for password change
-				echo "$config" > /tmp/rig.conf.new
-				while read line; do
-					[[ $line =~ ^RIG_PASSWD=\"(.*)\" ]] && NEW_PASSWD=${BASH_REMATCH[1]} && break
-				done < /tmp/rig.conf.new
-				rm /tmp/rig.conf.new
+
+		'config')
+			config="$( jq --raw-output '.config' <<< "$body" )"
+			justwrite="$( jq --raw-output '.justwrite' <<< "$body" )" #don't restart miner, just write config, maybe WD settings will be updated
+			if is_JSON_string_not_empty_or_null "$config"; then
+				#scan for a password change
+				while read -t 10 -r line; do
+					if [[ "$line" =~ ^RIG_PASSWD=\"(.+)\" ]]; then
+						NEW_PASSWD="${BASH_REMATCH[1]}"
+						break
+					fi
+				done <<< "$config"
 
 				# Password change ---------------------------------------------------
-				if [[ $RIG_PASSWD != $NEW_PASSWD ]]; then
-					echo -e "${RED}New password:${NOCOLOR} $NEW_PASSWD";
+				if [[ "$RIG_PASSWD" != "$NEW_PASSWD" ]]; then
+					log_line warning "Old password: $RIG_PASSWD, new password: $NEW_PASSWD"
 
-					message warning "Password change received, wait for next message..." --id=$cmd_id
-					request=$(jq -n --arg rig_id "$RIG_ID" --arg passwd "$RIG_PASSWD" \
-					'{ "method": "password_change_received", "params": {$rig_id, $passwd}, "jsonrpc": "2.0", "id": 0}')
-					response=$(echo $request | curl --insecure -L --data @- --connect-timeout 15 --max-time 25 --silent -XPOST "${HIVE_URL}?id_rig=$RIG_ID&method=password_change_received" -H "Content-Type: application/json")
+					message warning 'New password received, please wait...' --id="$cmd_id" --silent
+					request="$( jq --null-input --compact-output \
+						--arg rig_id "$RIG_ID" --arg passwd "$RIG_PASSWD" \
+						'{ "method": "password_change_received", "params": {$rig_id, $passwd}, "jsonrpc": "2.0", "id": 0}'
+					)"
+					request_endpoint="${API_HOST_URL_current}/worker/api?id_rig=${RIG_ID}&method=password_change_received"
+					response="$(
+						${curl_protocol}									\
+																			\
+							--location --data @- --silent					\
+																			\
+							--header 'Content-Type: application/json'		\
+							--request POST "$request_endpoint"				\
+																			\
+							--connect-timeout "$curl_connect_timeout"		\
+							--max-time "$curl_max_time"						\
+																			\
+						<<< "$request"
+					)"
 
-					exitcode=$?
-					[ $exitcode -ne 0 ] &&
-						message error "Error notifying hive about \"password_change_received\"" --id=$cmd_id &&
-						return $exitcode #better exit because password will not be changed
+					curl_exitcode=$?
+					if (( curl_exitcode != 0 )); then
+						log_line error 'Error notifying the server about "password_change_received"'
+						message error 'Error notifying the server about "password_change_received"' --id="$cmd_id" --silent
+						return "$curl_exitcode" #better exit because password will not be changed
+					fi
 
-					error=$(echo $response | jq '.error' --raw-output)
-					[[ ! -z $error && $error != "null" ]] && echo -e "${RED}Server error:${NOCOLOR} `echo $response | jq '.error.message' -r`" && return 1
+					error="$( jq --raw-output '.error' <<< "$response" )"
+					if is_JSON_string_not_empty_or_null "$error"; then
+						log_line error "Server error: $( jq --raw-output '.error.message' <<< "$response" )"
+						return 1
+					fi
 
-					echo "$response" | jq '.'
+					jq '.' <<< "$response"
 					#after this there will be new password on server, so all new request should use new one
 				fi
 
 				# Write new config and load it ---------------------------------------
-				echo "$config" > $RIG_CONF && sync
-				. $RIG_CONF
+				echo "$config" > "$RIG_CONF" && sync
+				# shellcheck disable=SC1090
+				source "$RIG_CONF"
 
 				# Save wallet if given -----------------------------------------------
-				wallet=$(echo $body | jq '.wallet' --raw-output)
-				[[ ! -z $wallet && $wallet != "null" ]] &&
-					echo "$wallet" > $WALLET_CONF
-
-
-				# Overclocking if given in config --------------------------------------
-#				oc_if_changed
-
+				if wallet="$( jq --raw-output '.wallet' <<< "$body" )" && is_JSON_string_not_empty_or_null "$wallet"; then
+					echo "$wallet" > "$WALLET_CONF" && sync
+				fi
 
 				# Final actions ---------------------------------------------------------
-				if [[ "$justwrite" != 1 ]]; then
-					#hostname-check
-					/hive/bin/miner restart
+				if (( "${justwrite:-0}" == 1 )); then
+					message ok 'Rig config changed' --id="$cmd_id" --silent
+				else
+					if /hive/bin/miner restart; then
+						message ok 'Rig config changed, miner restarted' --id="$cmd_id" --silent
+					else
+						message warning 'Rig config changed, but miner restarted with error' --id="$cmd_id" --silent
+					fi
+					echo
 				fi
 
 				# Start Watchdog. It will exit if WD_ENABLED=0 ---------------------------
-				[[ $WD_ENABLED=1 ]] && nohup wd stop > /tmp/nohup.out && nohup sleep 5> /tmp/nohup.out ; wd start &
+				[[ $WD_ENABLED=1 ]] && nohup wd stop && nohup sleep 5; wd start &
 
 				message ok "Rig config changed" --id=$cmd_id
 				#[[ $? == 0 ]] && message ok "Wallet changed, miner restarted" --id=$cmd_id || message warn "Error restarting miner" --id=$cmd_id
 			else
-				message error "No rig \"config\" given" --id=$cmd_id
+				message error 'No "wallet" config given' --id="$cmd_id" --silent
 			fi
 		;;
-		wallet)
-			wallet=$(echo $body | jq '.wallet' --raw-output)
-			if [[ ! -z $wallet && $wallet != "null" ]]; then
-				echo "$wallet" > $WALLET_CONF && sync
 
-				justwrite=
-				oc_if_changed
-
-				/hive/bin/miner restart
-				[[ $? == 0 ]] && message ok "Wallet changed, miner restarted" --id=$cmd_id || message warn "Error restarting miner" --id=$cmd_id
+		'asic')
+			hiveon_config="$( jq --raw-output '.asic' <<< "$body" )"
+			if is_JSON_string_not_empty_or_null "$hiveon_config"; then
+				grep -v '^_' <<< "$hiveon_config" > "$HIVEON_CONF"
+				grep -v '^_' <<< "$hiveon_config" > "$ASIC_CONF"
+				volt_conf="$( ant-functions.sh 'generate_volt_conf' <<< "$hiveon_config" )"
+				[[ -n "$volt_conf" ]] && echo "$volt_conf" > "$HIVEON_CONF_VOLT"
+				sync
+				if /hive/bin/miner restart; then
+					message ok 'ASIC config changed, miner restarted' --id="$cmd_id" --silent
+				else
+					message warning 'Error restarting miner' --id="$cmd_id" --silent
+				fi
 			else
-				message error "No \"wallet\" config given" --id=$cmd_id
+				message error 'No "asic" config given' --id="$cmd_id" --silent
 			fi
 		;;
-	esac
 
-	#Flush buffers if any files changed
-	sync
+		'')
+			# a kinda trap for the backend glitches
+			if [[ -n "$response" ]]; then
+				message warning "Empty command received from server" --payload --id="$cmd_id" --silent < <( jq '.' <<< "$response" )
+			else
+				message warning "Empty response received from server" --id="$cmd_id" --silent
+			fi
+			log_line error "Empty command received"
+		;;
+
+		*)
+			if [[ -n "$body" ]]; then
+				message warning "Unknown command '$command' received from server" --payload --id="$cmd_id" --silent < <( jq '.' <<< "$body" )
+			else
+				message warning "Unknown command '$command' received from server" --id="$cmd_id" --silent
+			fi
+			log_line error "Unknown command received: '$command'"
+		;;
+
+	esac
+}
+
+function sleep_with_progress_bar {
+	#
+	# print a shrinking progress bar while sleeping
+	#
+	# Usage: sleep_with_progress_bar 'seconds_to_sleep'
+	#
+
+	# args
+	local -r -i seconds_to_sleep="$1"
+
+	# vars
+	local -i this_step
+	local seconds_remaining_as_spaces seconds_remaining_as_dots
+
+	# code
+
+	for (( this_step = 0; this_step < seconds_to_sleep; this_step++ )); do
+		printf -v seconds_remaining_as_spaces '%*s' $(( seconds_to_sleep - this_step ))
+		seconds_remaining_as_dots="${seconds_remaining_as_spaces// /.}"
+		printf '\r%b%s%b%*s\r' "${DGRAY}" "$seconds_remaining_as_dots" "${NOCOLOR}" "$this_step"
+		snore 1
+	done
+	printf '\r%*s\n' "$seconds_to_sleep" # clear the line and then \n
+}
+
+function round_div_x100 {
+	#
+	# A simple integer division with round (https://stackoverflow.com/a/59414940/12559612)
+	# virtual decimal dot, nn.nn precision
+	#
+	# Usage: round_div_x100 'item' 'total'
+	#
+	# Example: round_div_x100 4 28 -> 1429 (actually 14.29)
+	#
+
+	# args
+	local -r -i item="${1-}"
+	local -r -i total="${2-}"
+
+	# consts
+	local -r -i item_x10000=$(( item * 10000 )) # 100.00
+
+	# code
+	echo $(( 2 * item_x10000 / total - item_x10000 / total ))
+}
+
+function calculate_quality {
+	#
+	# calculate a quality in percent from 'bad' and 'total' counters
+	# result in fake decimal-points: nn.nn
+	#
+	# Usage: calculate_quality 'bad_counter' 'total_counter'
+	#
+
+	# args
+	local -r -i bad_counter="${1-}"
+	local -r -i total_counter="${2-}"
+
+	# vars
+	local -i bad_percentage_x100 quality_percentage_x100
+	local quality_percentage_fake_decimal
+
+	# code
+	bad_percentage_x100="$( round_div_x100 "$bad_counter" "$total_counter" )"
+	(( quality_percentage_x100 = 100000 - bad_percentage_x100*10 )) # 100% - x
+	quality_percentage_fake_decimal="$( milliseconds_to_seconds "$quality_percentage_x100" )" # (int)7799 -> (string)77.99 (in fact, those milliseconds are centiseconds)
+
+	echo "$quality_percentage_fake_decimal"
+}
+
+function internal_watchdog {
+	# traps
+	#trap -- 'log_line debug "internal watchdog ${PPID}:${$}:${BASHPID} killed"' EXIT
+
+	# args
+	local -r -i timeout_in_s="${1-120}" # default is 2 minutes
+
+	# vars
+	local watchdog_id
+
+	# cod
+	watchdog_id="${PPID}:${$}:${BASHPID}"
+	log_line debug "internal watchdog $watchdog_id starting now, timeout is ${timeout_in_s}s"
+	snore "$timeout_in_s" # a pause to let the parent terminate this watchdog instance calmly
+
+	if (( is_pstree_supported_FLAG )); then
+		log_line error "internal watchdog $watchdog_id engadeg. BARK-BARK, time is out! Here's the process tree:"
+		echo
+		pstree -p "$PPID"
+		echo
+	else
+		log_line error "internal watchdog $watchdog_id engadeg. BARK-BARK, time is out!"
+	fi
+
+	# check for hanging external commands
+	# shellcheck disable=SC2034
+	# bc it's by ref
+	local -A procfs_STRUCT=()
+	local -i this_pid
+	local this_comm this_state this_ppid this_cmdline
+	if populate_procfs_struct 'procfs_STRUCT' 0; then
+		for this_pid in $( get_children_pids_of "$$" 'procfs_STRUCT' ); do
+			#                                    ^^ my proc group
+			#   ...and not me vvvvvvv
+			if (( this_pid != BASHPID )); then
+				# here's my sweet uterine sibling, let's slaugher it
+				{
+					this_ppid="$( get_pid_attribute "$this_pid" 'ppid' 'procfs_STRUCT' )"
+					this_comm="$( get_pid_attribute "$this_pid" 'comm' 'procfs_STRUCT' )"
+					this_state="$( get_pid_attribute "$this_pid" 'state' 'procfs_STRUCT' )"
+					this_cmdline="$( get_pid_cmdline_from_procfs "$this_pid" )"
+					if [[ "$this_state" != 'Z' ]]; then
+						# not a zombie
+						log_line debug "internal watchdog $watchdog_id: ${this_comm}[${this_state}]${this_cmdline} (PPID $this_ppid, PID $this_pid) hanging, sending SIGTERM"
+						if kill -0 "$this_pid" 2> /dev/null; then
+							# be nice, post SIGTERM first
+							kill -s SIGTERM "$this_pid"
+							snore 1
+							if kill -0 "$this_pid" 2> /dev/null; then
+								log_line debug "internal watchdog $watchdog_id: PID $this_pid is bulletproof, eh? okay, shooting SIGKILL"
+								kill -s SIGKILL "$this_pid"
+							fi
+						fi
+					else
+						# a zombie!
+						log_line debug "internal watchdog $watchdog_id: ${this_comm}[${this_state}]${this_cmdline} (PPID $this_ppid, PID $this_pid) goes zombie, sending SIGCHLD to $this_ppid"
+						kill -s SIGCHLD "$this_ppid" # to the parent
+						snore 10 # wait for the parent to put the zombie to rest (and then to kill the watchdog)
+						if kill -0 "$this_pid" 2> /dev/null; then
+							log_line debug "internal watchdog $watchdog_id: PID $this_pid is bulletproof, eh? okay, let's kill the whole agent"
+							kill -s SIGKILL "$this_ppid"
+						fi
+					fi
+				} & # let's parallel it all
+			fi
+		done
+	else
+		log_line error 'Something wrong with /procfs'
+	fi
+
+	snore "$timeout_in_s" # pause again to let the parent terminate this watchdog instance calmly
+	log_line error "internal watchdog $watchdog_id: Why I still am alive? Sending SIGUSR1 to my parent, PID $$"
+	kill -s SIGUSR1 "$$"
+	log_line error "internal watchdog $watchdog_id: Why I still am alive? Sending SIGCHLD to my parent, PID $$"
+	kill -s SIGCHLD "$$"
+
+	log_line debug "internal watchdog $watchdog_id: Really?! Looks like some the agent's malfunction--you should never see this message"
+	jobs -l
+	top -b -n1 | grep -vE '[0-9] \['
 }
 
 
+# global traps
 
-########################################################################################################################
+trap -- 'log_line debug "SIGHUP received, ignoring..."' SIGHUP
+#trap -- 'log_line debug  "\n\nAborting...\n\n"; snore 5' EXIT # !!! never this goes to production ever
+trap -- 'log_line debug "SIGUSR1 received, executing an unconditional return()"; return' SIGUSR1
 
-echo -e "\n\n[`date`] Started" >> $LOG
 
-while true
-do
-	time_start=`date +%s`
-	loop
-	time_finish=`date +%s`
+# global consts
 
-	wasted=$(( $time_finish - $time_start ))
+# paths to conf files
+# TODO move to /hive/etc/environment
+declare -r RIG_CONF='/hive-config/rig.conf'
+declare -r WALLET_CONF='/hive-config/wallet.conf'
+declare -r HIVEON_CONF='/hive-config/hiveon.conf'
+declare -r HIVEON_CONF_VOLT='/config/manual_freqs.txt'
+declare -r ASIC_CONF='/config/config.conf'
+# paths to runtime vars
+declare -r API_HOST_FILE='/run/hive/api_host_url' # an accessory file for the /hive/bin/message and /hive/bin/hello
+declare -r total_khs_FILE='/run/hive/khs'
+declare -r avg_khs_FILE='/run/hive/khs_avg' # Averages in JSON format
+declare -r arr_FILE='/run/hive/arr' # Accepted/Rejected ratio * 100
+declare -r last_cmd_id_FILE='/run/hive/last_cmd_id'
+declare -r confseq_FILE='/run/hive/confseq'
+declare -r latest_curl_log="/run/hive/${script_basename}-curl.log"  # looks like /tmp on a few models (at least on S9 hiveon) is on top of NAND -- let's wear it less
+#
+declare -r miner_API_host='localhost' # TODO rename 'miner' to 'cgminer'
+declare -r -i miner_API_port=4028
+#
+declare -r -i failover_connection_duration_in_m_DEFAULT=10
+declare -r -i failover_connection_duration_in_s_DEFAULT=$(( failover_connection_duration_in_m_DEFAULT * 60 ))
+declare -r -i push_interval_DEFAULT=10
+#
+declare -r -i curl_connect_timeout=15 curl_max_time=25
+#
+declare -r https_semaphore_flag_FILE="/run/hive/https-supported.flag"
+declare -r ca_cert_FILE='/etc/ssl/certs/ca-certificates.crt'
 
-	tosleep=$(( $INTERVAL - $wasted ))
+# global arrays
 
-	#echo "Sleeping $tosleep"
-	echo ""
+declare -a API_HOST_URLs_working_collection=()
+declare -a API_HOST_URLs_bootstrap_collection=(
+	# ??? should move it to /hive/etc/environment
+	'http://helsinki.hiveos.farm'
+	'http://msk.hiveos.farm'
+	'http://paris.hiveos.farm'
+	'http://amster.hiveos.farm'
+	'http://ca1.hiveos.farm'
+	'http://api-ru-cf.hiveos.farm'
+	'http://ap.hiveos.farm'
+	'http://naw.hiveos.farm'
+	'http://api2msk.hiveos.farm'
+	'http://api.hiveos.farm'
+)
 
-	if [[ $tosleep > 0 ]]; then
-		sleep $INTERVAL
+
+# global vars
+
+declare MINER='asicminer'
+declare total_khs system_status stats
+declare -i current_push_interval=push_interval_DEFAULT
+declare -i time_wasted_general time_remaining_general
+declare -i push_total_counter=0 push_bad_counter=0
+#
+declare -i time_start_failover_connection=0 seconds_passed_since_failover_connection=0 seconds_left_till_switch_to_main=0
+declare -i API_HOST_URLs_working_collection_index=0
+declare -i API_HOST_URLs_working_collection_size=0
+declare API_HOST_URL_current API_HOST_URL_main
+#
+declare -i saved_RIG_CONF_last_updated_time=0 saved_WALLET_CONF_last_updated_time=0
+declare -i internal_watchdog_time_limit
+
+
+# global flags
+
+declare -i https_disabled_message_sent_FLAG=0
+declare -i skip_the_sleep_FLAG=0
+declare -i is_failover_connection_in_force_FLAG=0
+declare -i is_api_host_file_relevant_FLAG=0
+declare -i can_haz_bootstrap_servers_FLAG=1 # let's act willfully
+declare -i is_pstree_supported_FLAG=0
+declare -i is_custom_push_interval_FLAG=0
+declare -i is_https_allowed_FLAG=0
+
+# sources
+
+# shellcheck disable=SC1091
+{
+	[[ -t 1 ]] && source /hive/bin/colors
+	source /hive/bin/asic-model
+	source /hive/bin/hive-functions.sh || { echo 'ERROR: /hive/bin/hive-functions.sh not found'; exit 1; }
+}
+
+
+# main
+
+#$PPID - might be parent screen pid
+screen_count="$( screen -ls | grep "\.agent" | grep -Fcv "$PPID" )"
+
+#there will be still 1 process for subshell
+#[[ `ps aux | grep "./agent" | grep -vE "grep|screen|SCREEN|$$" | wc -l` -gt 1 ]] &&
+if (( screen_count > 0 )); then
+	echo -e "${RED}Agent screen is already running${NOCOLOR}"
+	echo -e "Run ${CYAN}agent-screen${NOCOLOR} to resume screen"
+	exit 1
+fi
+
+log_line ok "$script_mission, version $script_version started"
+log_line info "Detected ASIC model: ${WHITE}$ASIC_MODEL"
+
+echo
+
+# (re)starting wd
+if (( "${WD_ENABLED:-0}" )); then
+	nohup wd stop &> /dev/null
+	snore 5
+fi
+wd start &
+
+log_line debug 'check https'
+
+# check https, set flag
+is_https_allowed; grab_exit_code_to_flag 'is_https_allowed_FLAG'
+curl_protocol="$( get_curl_cmdline )"
+log_line info "https flag: ${is_https_allowed_FLAG}"
+
+
+# set a flag for the process management
+pstree -p "$$" &> /dev/null	&& is_pstree_supported_FLAG=1
+
+# main infinite loop
+
+(( internal_watchdog_time_limit = curl_connect_timeout * ( ${#API_HOST_URLs_bootstrap_collection[@]} + 3 ) ))
+
+while true; do
+	SECONDS=0
+	skip_the_sleep_FLAG=0
+
+	internal_watchdog "$internal_watchdog_time_limit" 0<&- & disown # start the local watchdog with 1m timeout
+	internal_watchdog_PID="$!"
+
+	fetch_stats_and_push_them_to_server
+
+#	log_line debug "killing watchdog #$internal_watchdog_PID"
+	kill "$internal_watchdog_PID" || log_line debug "cannot kill watchdog #${internal_watchdog_PID}?"
+
+	if (( skip_the_sleep_FLAG )); then
+		# no interval to make the agent more responsive and instantly push last_cmd_id to the server
+		echo
+		(( script_DEBUG )) && log_line warning '[DEBUG] skip the nap to improve responsiveness after receiving a command'
 	else
-		echo -e "${YELLOW}WARNING: Stats sending interval > $INTERVAL seconds, hanging driver?${NOCOLOR}"
+		(( time_wasted_general = SECONDS ))
+		(( time_remaining_general = current_push_interval - time_wasted_general ))
+
+		(( time_remaining_general < 0 )) && log_line warning "Stats gathering/sending cycle took ${time_wasted_general}s, overtime is ${time_remaining_general/-}s"
+
+		sleep_with_progress_bar "$current_push_interval"
 	fi
 done
+
+exit 1 # and quote the raven: "nevermore!"

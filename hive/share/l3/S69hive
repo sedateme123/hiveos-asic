@@ -1,0 +1,490 @@
+#!/bin/sh
+
+
+#
+# Copyright (C) 2017  Hiveon Holding LTD
+# Distributed under Business Source License 1.1
+# License information can be found in the LICENSE.txt file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+# Linted by shellcheck 0.7.0
+# shellcheck shell=dash
+#
+
+
+readonly script_mission='Client for ASICs: L3 Boot & Deploy'
+readonly script_version='0.1.5'
+readonly script_basename="${0##*/}"
+readonly script_DEBUG="${script_DEBUG:-1}" # use value from env if exists
+
+
+# functions
+
+print_script_version () {
+	echo "${script_mission}, version ${script_version}"
+	echo
+}
+
+print_script_usage () {
+	echo "Usage: ${script_basename}"
+	echo
+# deploy is only for Series 17
+#	echo '  -d, --force-deploy        force to run a deployment procedure'
+	echo '  -f, --force-download      force to download a package from the download server'
+	echo
+}
+
+echo_action ()	{								echo "${script_basename}> ${*}..."		; }
+echo_info ()	{								echo "${script_basename}: ${*}"			; }
+echo_warning ()	{								echo "${script_basename}! ${*}"			; }
+echo_error ()	{								echo "${script_basename}! ${*}"			; } 1>&2
+echo_debug ()	{ [ "$script_DEBUG" -eq 1 ] &&	echo "${script_basename}: [DEBUG] ${*}"	; }
+
+die () {
+	local incoming_exitcode=$? # !!! must be the first line in the function to catch an incoming error code -- do not move
+
+	# args
+	local message="$1"
+	local exitcode="${2:-$incoming_exitcode}"
+
+	# code
+	[ -n "$message" ] && echo_error "$message"
+	exit "$exitcode"
+} 1>&2
+
+ok_or_die () {
+	local incoming_exitcode=$? # !!! must be the first line in the function to catch an incoming error code -- do not move
+
+	# args
+	local ok_message="$1"
+	local fail_message="$2"
+	local exitcode="${3:-$incoming_exitcode}"
+
+	# code
+	if [ "$incoming_exitcode" -eq 0 ]; then
+		echo_info "$ok_message"
+	else
+		die "$fail_message" "$incoming_exitcode"
+	fi
+
+	return "$exitcode"
+}
+
+set_all_outputs_to_log () {
+	# save stdout and stderr to file descriptors 3 and 4, then redirect these descriptors to log
+	if [ ! -f "$S69_reenter_flag_FILE" ]; then
+		exec 3>&1 4>&2 > "$own_log_FILE" 2>&1 # >
+		echo_debug "stdout/stderr redirected to $own_log_FILE"
+	else
+		exec 3>&1 4>&2 >> "$own_log_FILE" 2>&1 # >>
+		echo_debug "stdout/stderr redirected to $own_log_FILE (append mode)"
+	fi
+}
+
+restore_all_outputs_to_default () {
+	# restore stdout and stderr, see set_all_outputs_to_log()
+	echo_debug 'stdout/stderr redirection reset to default'
+	exec 1>&3 2>&4
+}
+
+get_full_client_version () {
+	# vars
+	local client_release_version
+	local client_release_version_FILE='/hive/etc/VERSION'
+	local client_build_version
+	local client_build_version_FILE='/hive/etc/build'
+
+	# code
+	[ -s "$client_release_version_FILE"	] && client_release_version="$( cat "$client_release_version_FILE" )"
+	[ -s "$client_build_version_FILE"	] && client_build_version="$( cat "$client_build_version_FILE" )"
+
+	# code
+	echo "${client_release_version:-undefined}-${client_build_version:-undefined}"
+}
+
+get_random_number_between () {
+	#
+	# Usage: get_random_number_between 'min' 'max'
+	#
+
+	# args
+	local min="$1"
+	local max="$2"
+
+	# code
+	awk -v min="$min" -v max="$max" 'BEGIN{srand(); print int(min+rand()*(max-min+1))}'
+}
+
+is_string_contain () {
+	#
+	# Usage: is_string_contain 'string' 'substring'
+	#
+
+	# args
+	local string="$1"
+	local substring="$2"
+
+	# code
+	case "$string" in
+		*"$substring"*	)	return 0	;;
+		*				)	return 1	;;
+	esac
+}
+
+get_words_count () {
+	#
+	# Usage: get_words_count 'word0 word1 ... wordN'
+	#
+
+	# code
+	echo "$*" | wc -w
+}
+
+get_word_by_index () {
+	#
+	# Usage: get_word_by_index 'index' 'word1 word2 ... wordN'
+	#        get_word_by_index 'index' 'word1' 'word2' '...' 'wordN'
+	#
+	# !!! index is 1-based
+
+	# args
+	local index="$1"
+
+	# code
+	#shift
+#   ^ shift is commented == 1-based index
+#     shift isn't commented == 0-based index
+
+	# shellcheck disable=SC2048,SC2086
+	# bs we need this as is
+	set -- $* # re-parse args by IFS
+	if [ "$index" -lt "$#" ]; then
+		shift "$index"
+		echo "$1"
+	else
+		echo_error 'get_word_by_index(): index is out of bounds'
+		return 1
+	fi
+}
+
+parse_arguments () {
+	#
+	# Usage: parse_arguments "$@"
+	#
+
+	# vars
+	local this_ARG
+
+	# code
+	for this_ARG in "$@"; do
+		case "$this_ARG" in
+			'-f'|'--force-download')
+				force_download_FLAG=1
+				;;
+# force deploy is only for Series 17, yet
+#			'-d'|'--force-deploy')
+#				force_deploy_FLAG=1
+#				;;
+			'start'|'stop'|'restart')
+				executed_by_rc_FLAG=1
+				;;
+			'')
+				: ok good to go
+				;;
+			'-h'|'--help')
+				print_script_version
+				print_script_usage
+				exit 1
+				;;
+			*)
+				print_script_version
+				echo "Invalid option '$this_ARG'"
+				echo
+				print_script_usage
+				exit 1
+				;;
+		esac
+	done
+}
+
+check_and_export_PATHs () {
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go										;;
+		'')							export PATH='/hive/bin:/hive/sbin'					;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"			;;
+	esac
+
+	case "$LD_LIBRARY_PATH" in
+		*'/hive/lib'*)				: ok good to go										;;
+		'')							export LD_LIBRARY_PATH='/hive/lib'					;;
+		*)							export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/hive/lib"	;;
+	esac
+}
+
+clean_up_files () {
+	for this_file in "${@}"; do
+		if [ -f "$this_file" ]; then
+			if rm "$this_file"; then
+				echo_debug "clean_up_files(): $this_file removed"
+			else
+				echo_error "clean_up_files(): failed to remove $this_file"
+			fi
+		fi
+	done
+}
+
+is_client_installed () {
+	#
+	# a huge cut-cornering to check the client is in the place
+	# actually it's a temporary (an inline joke for the fellow IT archaeologists) stub
+	# the right way to do that is one and only 'md5sum -c FILE'
+	#
+	[ -s "$end_of_package_FILE" ]
+}
+
+
+farmhash_processing () {
+	# $FARM_HASH can be defined externally
+	# TODO should we move this functionality to hello? bc we don't have a sufficiently good context before /hive/bin/hive -- like no failover DNSes
+
+	if [ -s /config/FARM_HASH ]; then
+		FARM_HASH=$( cat /config/FARM_HASH ) # TODO sanitizing
+		echo_info "There is /config/FARM_HASH file containing '$FARM_HASH'"
+		echo_action 'Executing firstrun'
+		if [ -n "$FARM_HASH" ]; then
+			/hive/bin/firstrun "$FARM_HASH" && rm /config/FARM_HASH # delete file only on success
+		fi
+	fi
+}
+
+prepare_to_boot_client_l3 () {
+	[ ! -e /hive ]									&& ln -s /config/hive/hive/ /hive
+	[ ! -e /hive-config ]							&& ln -s /config/hive/hive-config/ /hive-config
+	[ ! -e /home/root/.profile ]					&& ln -s /config/hive/home/root/.profile /home/root/.profile
+	[ -d /hive-config ] && [ ! -L /hive-config ]	&& mv -f /hive-config /config/hive/
+	[ ! -L /hive-config ] && [ ! -e /hive-config ]	&& ln -s /config/hive/hive-config/ /hive-config
+
+	if [ -f /hive/share/.profile ]; then
+		cp -rf /hive/share/.profile /home/root/ # new .profile location
+	else
+		cp -rf /hive/share/S9/.profile /home/root/ # outdated
+	fi
+}
+
+download_and_deploy_client_l3 () {
+	# vars
+	local download_server_url_from_special_file
+	local url_collection url_collection_size url_collection_iterator
+	local this_file this_file_content this_url
+	local snooze_time snooze_time_from snooze_time_to retries_counter
+
+	# code
+	cd /tmp || die 'Cannot cd to /tmp'
+
+	# 1. download a tarball, if: argument is set OR /config/latest.tar.gz not exists OR exists but failed to extract
+	if [ "$1" = '--force-download' ] || ! gunzip -tvf "$persistent_package_FILE" > /dev/null 2>&1; then
+
+		# 1.1 assemble the collection of URLs
+
+		#								purpose					location			format		sanitize?*	desc
+		# /config/HIVE_HOST_URL			API server URL			NVRAM				string		+			also accessible as a text file in the fw package
+		# /config/hive-url				API server URL			NVRAM				string		+
+		# /config/hive-downloads-url	Download server URLs	NVRAM				list		-
+		# /etc/hive-url					API server URL			Firmware package	string		+
+		# /etc/hive-downloads-url		Download server URLs	Firmware package	list		-
+		#
+		# *in the case we don't have any "Download server URLs" files, we use "API server URL" with some sanitization:
+		# 1) change "api." to "download."; 2) permission to use only if that address contains "download"
+
+		for this_file in	'/config/HIVE_HOST_URL'			\
+							'/config/hive-url'				\
+							'/config/hive-downloads-url'	\
+							'/etc/hive-url'					\
+							'/etc/hive-downloads-url'		; do
+
+			if [ -s "$this_file" ]; then
+				if is_string_contain "$this_file" 'hive-downloads-url'; then
+					# no need to sanitize -- it's a somewhat trusted location
+					this_file_content="$( cat "$this_file" )"
+				else
+					# do sanitize
+					this_file_content="$( sed 's|//api\.|//download.|; s|[^[:alnum:].:/%-]||g' < "$this_file" )"
+				fi
+				echo_info "$this_file found: '$this_file_content'"
+				if [ -n "$this_file_content" ]; then
+					# add element to a space-delimited collection, so we can iterate over this later
+					download_server_url_from_special_file="$download_server_url_from_special_file $this_file_content"
+				fi
+			fi
+		done
+
+		# add main and failover locations to the end of the collection
+		url_collection="${download_server_url_from_special_file} ${download_server_url_default} ${download_server_url_failover}"
+		url_collection_size="$( get_words_count "$url_collection" )"
+
+		# initialize loop counters
+		retries_counter=0
+		url_collection_iterator=0
+		snooze_time_from=5
+		snooze_time_to=30
+
+		# 1.2 download and check integrity
+		while true; do
+			: $(( retries_counter += 1 ))
+
+			snooze_time="$( get_random_number_between "$snooze_time_from" "$snooze_time_to" )"
+
+			if [ "$retries_counter" -eq 1 ]; then
+				# first iteration only
+				echo_action "Waiting ${snooze_time}s (random pause for better bulk operations)"
+			else
+				echo_error "Something went wrong... The next try #${retries_counter} in $snooze_time seconds"
+				# another snooze time randomization range from now on
+				snooze_time_from=15
+				snooze_time_to=60
+			fi
+
+			sleep "$snooze_time"
+
+			# iterate thru a URL collection
+			if [ "$url_collection_iterator" -lt "$url_collection_size" ]; then
+				: $(( url_collection_iterator += 1 )) # advance an iterator by one
+			else
+				url_collection_iterator=1 # start all over again
+			fi
+			this_url="$( get_word_by_index "$url_collection_iterator" "$url_collection" )"
+
+			# try to download
+			echo_action "Downloading Client package from $this_url"
+			if curl --silent --fail --show-error --location --insecure "${this_url}${package_url_path}" --output "$just_downloaded_package_FILE"; then
+				echo_info 'Downloaded OK'
+			else
+				echo_error 'Download FAILED'
+				continue # take a chance with a next URL
+			fi
+
+			echo_action 'Checking a Client package integrity'
+			if gunzip -tvf "$just_downloaded_package_FILE" > /dev/null 2>&1; then
+				# all is good, proceed further
+				echo_info 'Integrity checked OK'
+				break
+			else
+				echo_error 'Integrity check FAILED'
+				continue # take a chance with a next URL (indeed it's a bit redundant but explicit)
+			fi
+		done
+
+		# 1.3 copy to a persistent storage
+		echo_action 'Copying a downloaded package to the persistent storage'
+		cp -rf "$just_downloaded_package_FILE" "$persistent_package_FILE"; ok_or_die 'Copied OK' 'Copying FAILED'
+		[ -e "$just_downloaded_package_FILE" ] && rm -rf "$just_downloaded_package_FILE" # usually we don't have much space in /tmp
+		sync
+	fi
+
+	# 2. extract
+	echo_action 'Extracting Client files from the package to the temporary directory'
+	[ ! -d /config/hive ] && mkdir -p /config/hive/hive-config
+	tar -xzv -f "$persistent_package_FILE" > /dev/null; ok_or_die 'Extracted OK' 'Extracting FAILED'
+
+	[ -L /hive ] && rm /hive
+
+	echo_action 'Copying extracted Client files from the temporary directory to the working directory'
+	cp -rf /tmp/hiveos-asic-*/* /config/hive/; ok_or_die 'Copied OK' 'Copying FAILED'
+
+	echo_action 'Deleting temporary files'
+	rm -rf /tmp/hiveos-asic*
+
+	sync
+	sleep 2 # settling the dust
+}
+
+
+# global traps
+
+trap -- '' HUP INT	# any child process will inherit only disabled traps (enabled ones will be reset to default)
+					# ash/dash-specific, doesn't apply to bash
+
+
+# global consts
+
+readonly own_log_FILE='/tmp/.S69hive.log' # hide the log, so shell won't include this file while expanding "*.log"
+readonly S69_ok_flag_FILE='/tmp/.hive-S69-ok'
+readonly S69_reenter_flag_FILE='/tmp/.hive-S69-reenter'
+readonly end_of_package_FILE='/config/hive/hive/share/zzz/EOF'
+#
+readonly current_S69_FILE='/etc/rcS.d/S69hive'
+readonly updated_S69_FILE='/config/hive/hive/share/l3/S69hive'
+#
+readonly persistent_package_FILE='/config/latest.tar.gz'
+readonly just_downloaded_package_FILE='/tmp/latest_just_downloaded.tar.gz'
+#
+readonly download_server_url_default='http://download.hiveos.farm'
+readonly download_server_url_failover='http://download2.hiveos.farm'
+readonly package_url_path='/asic/client/latest.tar.gz'
+
+
+# global flags
+
+#dev_build_FLAG=0
+force_download_FLAG=0
+# deploy is only for Series 17
+#force_deploy_FLAG=0
+executed_by_rc_FLAG=0
+
+
+# code
+
+set_all_outputs_to_log # [ ! -t 1 ] check doesn't work, hmm
+
+echo_action "$script_mission $script_version started"
+
+# check for a newer version of this very script
+if [ -x "$updated_S69_FILE" ] && ! cmp -s "$updated_S69_FILE" "$current_S69_FILE"; then
+	echo_action "$current_S69_FILE is outdated, replacing with $updated_S69_FILE"
+	touch "$S69_reenter_flag_FILE"
+	cp -rf "$updated_S69_FILE" "$current_S69_FILE"
+
+	restore_all_outputs_to_default
+	set_all_outputs_to_log # switch to the append mode
+	( "$updated_S69_FILE" "$@" & ) # double-fork a newer version
+
+	exit 0
+fi
+
+# remove flag files, old logs and a deprecated teleconsole--to get some air
+clean_up_files "$S69_ok_flag_FILE" "$S69_reenter_flag_FILE" /tmp/*.log '/config/hive/hive/sbin/teleconsole'
+
+check_and_export_PATHs
+parse_arguments "$@"
+
+[ ! -d /config/hive/hive-config ] && mkdir -p /config/hive/hive-config
+
+# Series 17 only
+if [ "$executed_by_rc_FLAG" -eq 1 ]; then
+#	exec >> "$own_log_FILE" 2>&1
+	pretty_formatted_cmdline="$( printf '%s' "$0"; printf " '%s'" "$@" )"
+	echo_info "Started by rc (cmdline: $pretty_formatted_cmdline), output logged to $own_log_FILE"
+fi
+
+if ! is_client_installed; then
+	echo_action 'Installed Client has not been found, checking the package'
+	download_and_deploy_client_l3
+elif [ "$force_download_FLAG" -eq 1 ]; then
+	echo_info '[OPTION] Forced download ON'
+	download_and_deploy_client_l3 --force-download
+else
+	echo_action 'Installed Client has been found'
+fi
+
+echo_action 'Preparing directories and symlinks'
+prepare_to_boot_client_l3
+
+echo_action 'Checking FARM_HASH'
+farmhash_processing
+
+echo_action "Booting $( get_full_client_version )"
+#restore_all_outputs_to_default
+touch "$S69_ok_flag_FILE" # set OK flag file
+
+( /hive/bin/hive < /dev/null > /tmp/client-boot.log 2>&1 & ) # double fork: init (PID 1) should inherit this process
+
+exit 0

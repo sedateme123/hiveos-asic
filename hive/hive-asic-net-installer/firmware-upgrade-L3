@@ -1,0 +1,61 @@
+#!/bin/sh -e
+
+
+#
+# Copyright (C) 2016-2020  Hiveon
+# Distributed under GNU GENERAL PUBLIC LICENSE 2.0
+# License information can be found in the LICENSE file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE
+#
+
+
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/hive/bin:/hive/sbin
+
+URL="$1"
+file=/tmp/$$
+
+trap atexit 0
+
+atexit() {
+        rm -rf $file
+        umount $file.boot 2>/dev/null || true
+        rmdir $file.boot 2>/dev/null || true
+        sync
+        if [ ! $ok ]; then
+            print "<h1>System upgrade failed</h1>"
+        fi
+}
+
+
+mkdir $file
+cd $file
+curl "$URL" | tar xvz
+if [ -f runme.sh ]; then
+        sh runme.sh
+else
+    if [ -e /dev/mmcblk0p3 ]; then
+                mkdir $file.boot
+        mount /dev/mmcblk0p1 $file.boot
+        cp -rf * $file.boot/
+        umount $file.boot
+        sync
+        fi
+        if [ -e /dev/mtd8 ]; then
+                if [ -f initramfs.bin.SD ]; then
+                        echo "flash romfs"
+                        flash_eraseall /dev/mtd8 >/dev/null 2>&1
+                        nandwrite -p /dev/mtd8 initramfs.bin.SD >/dev/null 2>&1
+                fi
+
+                if [ -f uImage.bin ]; then
+                        echo "flash kernel"
+                        flash_eraseall /dev/mtd7 2>/dev/null
+                        nandwrite -p /dev/mtd7 uImage.bin 2>/dev/null
+                fi
+        fi
+fi
+
+echo
+echo "done"
+
+sleep 1; /sbin/reboot -f
+

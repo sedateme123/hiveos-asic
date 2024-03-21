@@ -1,111 +1,474 @@
 #!/hive/sbin/bash
+
+
+#
+# Copyright (C) 2017  Hiveon Holding LTD
+# Distributed under Business Source License 1.1
+# License information can be found in the LICENSE.txt file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+
+
+readonly script_mission='Client for ASICs: The Client Start'
+readonly script_version='0.3.3'
+readonly script_basename="${0##*/}"
+
+
+# !!! bash strict mode, no unbound variables
+#set -o nounset # commented out for production bc still not tested thoroughly
+
+
+# functions
+
+function echo_x {
+	# args
+	local -r event_type="${1-}"
+	local -r event_message="${2-}"
+	local -r event_statement="${3-}"
+
+	# vars
+	local event_prefix statement_color event_suffix
+	local name_color="${LGRAY-}"
+
+	# code
+	case "$event_type" in
+		'ok'		)	event_prefix=':'		;	statement_color="${BGREEN-}"	;	event_suffix=''								;;
+		'action'	)	event_prefix='>'		;	statement_color="${WHITE-}"		;	event_suffix='...'							;;
+		'info'		)	event_prefix=':'		;	statement_color=''				;	event_suffix=''								;;
+		'warning'	)	event_prefix=':'		;	statement_color="${BYELLOW-}"	;	event_suffix=''								;;
+		'debug'		)	event_prefix=' [DEBUG]:';	statement_color="${BPURPLE-}"	;	event_suffix=''	;	name_color="${DGRAY-}"	;;
+		'error'		)	event_prefix=':'		;	statement_color="${BRED-}"		;	event_suffix=''								;;
+	esac
+	if [[ -z "$event_statement" ]]; then
+		echo -e "${name_color}${script_basename}${event_prefix} ${statement_color}${event_message}${event_suffix}${NOCOLOR-}"
+	else
+		echo -e "${name_color}${script_basename}${event_prefix} ${NOCOLOR-}${event_message}${event_suffix} ${statement_color}${event_statement}${NOCOLOR-}"
+	fi
+}
+
+function enable_mtu_autodetect {
+	#
+	# Usage: enable_mtu_autodetect
+	#
+
+	# code
+	echo '1' > /proc/sys/net/ipv4/tcp_mtu_probing # man 7 tcp: 1 Disabled by default, enabled when an ICMP black hole detected
+	echo '1024' > /proc/sys/net/ipv4/tcp_base_mss # bumps the starting MSS used in discovery from a miserable default of 512 bytes to an RFC4821 suggested 1,024 (c) Cloudflare blog
+}
+
+function disable_avahi_daemon {
+	#
+	# Usage: disable_avahi_daemon
+	#
+
+	# code
+	[[ -f /etc/init.d/avahi			]] && /etc/init.d/avahi stop # add && -f /usr/sbin/avahi-daemon ???
+	[[ -f /usr/sbin/avahi-daemon	]] && mv /usr/sbin/avahi-daemon /usr/sbin/avahi-daemon-disabled
+	kill_all 'avahi' # because '/etc/init.d/avahi stop' does not work on some models
+}
+
+function set_https_semaphore_file {
+	#
+	# Usage: set_https_semaphore_file
+	#
+
+	# code
+	touch "$https_semaphore_flag_FILE"
+}
+
+function is_https_supported {
+	#
+	# Usage: is_https_supported
+	#
+
+	# consts
+	local -r is_openssl_RE='OpenSSL'
+
+	# vars
+	local curl_answer=''
+
+	# code
+
+	# 1. assert that curl does exist
+	if hash curl 2>/dev/null; then
+		: ok
+	else
+		return 1 # would we enhance error handling later?
+	fi
+
+	# 2. assert that ca-cert does exist
+	if [[ -s "$ca_cert_FILE" ]]; then
+		: ok
+	else
+		return 2
+	fi
+
+	# 3. assert that curl has the openssl backend build in
+	curl_answer="$( curl --version )"
+	if [[ "$curl_answer" =~ $is_openssl_RE ]]; then
+		: ok
+	else
+		return 3
+	fi
+
+	return 0
+}
+
+function is_process_not_running { # cloned from the hive-functions.sh library
+
+	# args
+	(( $# == 1 )) || return 1
+	local -r process_name="${1-}"
+
+	# code
+	! if hash pidof 2>/dev/null; then
+		pidof "$process_name" > /dev/null
+	else
+		# shellcheck disable=SC2009
+		ps | grep -q "[${process_name:0:1}]${process_name:1}" # neat trick with '[p]attern'
+		# ...bc we don't have pgrep
+	fi
+}
+
+function is_directory_exist_and_writable {
+	#
+	# Usage: is_directory_exist_and_writable 'directory_to_check'
+	#
+
+	# args
+	(( $# == 1 )) || return 1
+	local -r directory_to_check="${1-}"
+
+	# code
+	[[ -d "$directory_to_check" && -w "$directory_to_check" ]]
+}
+
+function kill_all {
+	# args
+	local -r process_name_to_kill="$1"
+
+	# vars
+	local -i this_process_id
+	local process_name_to_kill_sanitized
+
+	# code
+	if hash killall 2>/dev/null; then
+		killall -q "$process_name_to_kill"
+	else
+		# not all systems have killall
+		process_name_to_kill_sanitized="[${process_name_to_kill::1}]${process_name_to_kill:1}" # enclose the first char in square [b]rackets
+		for this_process_id in $( ps | awk "/$process_name_to_kill_sanitized/{print \$1}" ); do
+			kill -9 "$this_process_id" > /dev/null 2>&1
+		done
+	fi
+}
+
+function get_absolute_difference {
+	#
+	# Usage: get_absolute_difference 'number1' 'number2'
+	#
+
+	echo $(( $1 >= $2 ? $1 - $2 : $2 - $1 ))
+}
+
+function get_datetime_from_server {
+	# consts
+	local -r HIVE_HOST_URL_default='http://api.hiveos.farm'
+	local -r -i max_attempts=3
+
+	# vars
+	local server_answer
+	local -i current_system_date_in_s date_from_server_in_s difference_in_dates
+	local -i curl_exitcode attempts_counter
+
+	# code
+	[[ -s "$RIG_CONF"		]] && source "$RIG_CONF"
+	[[ -s "$API_HOST_FILE"	]] && source "$API_HOST_FILE" # load the most relevant HIVE_HOST_URL variable, if exists
+
+	if [[ -z "${HIVE_HOST_URL-}" ]]; then
+		echo_x warning "HIVE_HOST_URL is empty, using default server $HIVE_HOST_URL_default"
+		HIVE_HOST_URL="$HIVE_HOST_URL_default"
+	fi
+
+	# trying to get a datetime (every next pause will be longer and longer)
+	for (( attempts_counter = 1; attempts_counter <= max_attempts; attempts_counter++ )); do
+		server_answer="$( curl --silent --connect-timeout "$attempts_counter" --retry 2 --retry-delay 0 --head "${HIVE_HOST_URL/https/http}" 2>&1 )" # http only
+		curl_exitcode=$?
+		if (( curl_exitcode )); then
+			echo_x error "$( human-curl-error "$curl_exitcode" )"
+			[[ -n "$server_answer" ]] && echo_x error "$server_answer"
+			echo_x error "Connection attempt #$attempts_counter to $HIVE_HOST_URL failed, will try again in ${attempts_counter}s..."
+			sleep "$attempts_counter"
+		else
+			printf -v current_system_date_in_s '%(%s)T' -1
+			if date_from_server_in_s="$( grep -Fm1 'Date:' <<< "$server_answer" | cut -d' ' -f3-6 | timetran 2> /dev/null )" && (( date_from_server_in_s )); then
+				difference_in_dates="$( get_absolute_difference "$current_system_date_in_s" "$date_from_server_in_s" )"
+				if (( difference_in_dates <= 3 )); then
+					echo_x ok		"Current system date $( date )"	'(up-to-date)'
+				else
+					echo_x warning	"Current system date $( date )"	'(OBSOLETE)'
+					echo_x ok		'System date set to '			"$( date -s "@$date_from_server_in_s" )"
+				fi
+			else
+				echo_x error		"The server returned an invalid answer: $server_answer"
+				echo_x warning		"Current system date $( date )"	'(NON-VALIDATED)'
+			fi
+			break
+		fi
+	done
+
+	if (( curl_exitcode > 0 )); then
+		echo_x error "Unable to connect to $HIVE_HOST_URL. No attempts left."
+	fi
+}
+
+
 # __    __         __                  _                                            _                      _
 #/ / /\ \ \___    /__\ ___  __ _ _   _(_)_ __ ___     /\/\   ___  _ __ ___    /\/\ (_)_ __   ___ _ __ __ _| |___
 #\ \/  \/ / _ \  / \/// _ \/ _\`| | | | | '__/ _ \   /    \ / _ \| '__/ _ \  /    \| | '_ \ / _ \ '__/ _\`| / __|
 # \  /\  /  __/ / _  \  __/ (_| | |_| | | | |  __/  / /\/\ \ (_) | | |  __/ / /\/\ \ | | | |  __/ | | (_| | \__ \
 #  \/  \/ \___| \/ \_/\___|\__, |\__,_|_|_|  \___|  \/    \/\___/|_|  \___| \/    \/_|_| |_|\___|_|  \__,_|_|___/
 #                             |_|
-#export PATH="./:/hive/bin:/hive/sbin:$PATH"
-export PATH=$PATH:/hive/bin:/hive/sbin
-export LD_LIBRARY_PATH=/hive/lib
-
-#ASIC_MODEL=`sed -n 2p /usr/bin/compile_time`
-. asic-model
-
-date
-
-#ls -l /var/volatile/tmp/
-
-function echo2 {
-#	echo -e "$1" >> /tmp/hive.boot.log
-	echo -e "$1"
-}
-
-if [[ "$ASIC_MODEL" =~ "Antminer D3 Blissz" ]]; then
-	ln -s /usr/lib/libcurl-gnutls.so.4 /usr/lib/libcurl.so.5
-fi
-
-#Make directory in RAM
-mkdir -p /run/hive
-
-#wipe screens. for some reason there can be dead sockets after restart on tmpfs (!!!)
-screen -wipe
 
 
-#ensure we have unix config
-dos2unix-safe /hive-config/rig.conf
+# consts
+
+# files and paths
+declare -r RIG_CONF_default='/hive-config/rig.conf'
+declare -r RIG_CONF="${RIG_CONF:-$RIG_CONF_default}" # for ASIC emulator: set to default only if RIG_CONF variable is empty
+declare -r client_run_DIR='/run/hive'
+declare -r client_tmp_DIR="${client_run_DIR}/tmp"
+declare -r API_HOST_FILE='/run/hive/api_host_url' # an accessory file for the /hive/bin/message and /hive/bin/hello
+# https support section
+declare -r ca_cert_FILE='/etc/ssl/certs/ca-certificates.crt'
+declare -r https_semaphore_flag_FILE="$client_run_DIR/https-supported.flag"
 
 
-RIG_CONF="/hive-config/rig.conf"
+# exports
 
-#[ -t 1 ] &&
-. colors #use them anyway
-
-
-uname=`uname -a`
-
-msg=$(cat <<EOF
-$uname
-$BYELLOW
- _______ _______ ___ ___ _______
-|   |   |_     _|   |   |    ___|
-|       |_|   |_|   |   |    ___|
-|___|___|_______|\_____/|_______|
-
-${CYAN}`hostname`${NOCOLOR}
-${BPURPLE}`ip -o -4 addr list eth0 | awk '{print $4}' | cut -d/ -f1`${NOCOLOR}
-
-EOF
-)
-
-echo2 "$msg"
+[[ ! "$PATH" =~ (^|:)/hive/bin:/hive/sbin(:|$) ]] && export PATH="$PATH:/hive/bin:/hive/sbin" # add only if not exist
+[[ ! "$LD_LIBRARY_PATH" =~ (^|:)/hive/lib(:|$) ]] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:}/hive/lib" # save $LD_LIBRARY_PATH:/hive/share/S9/lib for hiveon
+# we don't need a fancy UTF or anything outside the POSIX/ANSI-C grammar
+export LC_ALL=C
+export LANG=C
 
 
-### OpenVPN #############################################################################################
-#openvpn-install
-#will wait for interface
+# sources
 
-if [[ $ASIC_MODEL == "Antminer S9" || $ASIC_MODEL == "Antminer T9+" || $ASIC_MODEL == "Antminer T9" || $ASIC_MODEL == "Antminer S9i" || $ASIC_MODEL == "Antminer S9j" || $ASIC_MODEL == "Antminer S9 Hydro" || $ASIC_MODEL == "Antminer E3" || $ASIC_MODEL == "Antminer " || $ASIC_MODEL =~ "Antminer S9 (vnish" || $ASIC_MODEL =~ "Antminer S9" || $ASIC_MODEL =~ "Antminer S11" ]]; then
-    echo2 "> Applying crontab"
-    [[ ! -d /var/spool/cron/crontabs ]] && ln -s /tmp  /var/spool/cron/crontabs
-    crontab /hive/etc/crontab.root
-    [[ `ps aux | grep "crond" | grep -v grep | wc -l` = 0 ]] &&
-            /usr/sbin/crond
-    echo2 "> Patching upgrade"
-    cd /www/pages/cgi-bin/
-    patch -p10 /www/pages/cgi-bin/upgrade.cgi < /hive/share/S9/upgrade.cgi.patch
-    sed -i '/\#\#\# HIVE HECK \#\#\#/,$d' /config/network.conf
+source /hive/bin/colors
+source /hive/bin/asic-model
+
+
+# model dependend PATHs and libraries
+
+[[ "$ASIC_MODEL" == 'Toddminer C1'* && ! "$PATH" =~ (^|:)/sbin ]] && export PATH="$PATH:/sbin:/usr/sbin" # add only if not exist
+[[ "$ASIC_MODEL" == 'Antminer D3 Blissz'* ]] && ln -s /usr/lib/libcurl-gnutls.so.4 /usr/lib/libcurl.so.5
+
+
+# code
+
+uname -a
+
+
+# suid the busybox.suid
+if busybox_suid_FILE="$( command -v busybox.suid )" && [[ -n "$busybox_suid_FILE" ]]; then
+	# Antminer S9
+	chmod u+s "$busybox_suid_FILE" # suid busybox.suid, for the diagnostic utility running as 1000:1000 from cgi-bin script
 fi
 
 
-if [[ $ASIC_MODEL =~ "WhatsMiner M10" ]]; then
-    echo2 "> Applying crontab"
-    #[[ ! -d /var/spool/cron/crontabs ]] && ln -s /tmp  /var/spool/cron/crontabs
-    crontab /hive/share/whatsminer/crontab.root
-    [[ `ps aux | grep "crond" | grep -v grep | wc -l` = 0 ]] &&
-            /usr/sbin/crond
+# make our own tmpfs
+mkdir -p "$client_run_DIR"
+if ! mount | grep -q "$client_run_DIR type tmpfs"; then
+	# 1. not mounted with tmpfs
+	if [[ -d "$client_run_DIR" && "$( echo "${client_run_DIR}"/* )" != "${client_run_DIR}/*" ]]; then
+		# 2. does exist and has file(s)
+		echo_x action "Purging on-flash $client_run_DIR"
+		rm -rf "${client_run_DIR:-SAFE}"/* # the purpose is to purge old temp files which are located on physical storage
+	fi
+	echo_x action "Mounting $client_run_DIR to the RAM"
+	mount -t tmpfs none "$client_run_DIR"
+	mkdir -p "$client_tmp_DIR"
+else
+	echo_x info "$client_run_DIR already mounted to the RAM"
+fi
+# set one of these as a temp directory for bash
+# because we've got helluva Here Strings ([n]<<<word) in our scripts
+# which, in turn, are done by temporary files under the hood
+export TMPDIR="$client_tmp_DIR"
+
+
+# wipe screens. for some reason there might be dead sockets after restart on tmpfs (!!!)
+screen -wipe > /dev/null
+
+
+if [[ $ASIC_MODEL =~ "Antminer S15" || $ASIC_MODEL =~ "Antminer T15" || $ASIC_MODEL =~ "Antminer S9 SE" || $ASIC_MODEL =~ "Antminer S9k" ]]; then
+	: nothing
+	#echo_x action 'Applying crontab'
+	#nohup /hive/sbin/bash -c 'sleep 60; /hive/bin/cron1' > /dev/null 2>&1 &
+	#nohup /hive/sbin/bash -c 'sleep 60; /hive/bin/cron2' > /dev/null 2>&1 &
+elif [[ $ASIC_MODEL == "Antminer S9" || $ASIC_MODEL =~ "Antminer T9+" || $ASIC_MODEL =~ "Antminer S10" || $ASIC_MODEL =~ "Antminer T9" || $ASIC_MODEL == "Antminer S9i" || $ASIC_MODEL == "Antminer S9j" || $ASIC_MODEL == "Minecenter S9" || $ASIC_MODEL == "Antminer S9 Hydro" || $ASIC_MODEL == "Antminer E3" || $ASIC_MODEL == "Antminer " || $ASIC_MODEL =~ "Antminer S9 (vnish" || $ASIC_MODEL =~ "Antminer S9" || $ASIC_MODEL =~ "Antminer S11" ]]; then
+	echo_x action 'Applying crontab'
+	[[ ! -d /var/spool/cron/crontabs ]] && ln -s /tmp /var/spool/cron/crontabs
+	crontab /hive/etc/crontab.root
+	is_process_not_running 'crond' && /usr/sbin/crond
+	#hosts patch
+	touch /tmp/hosts
+	export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/hive/share/S9/lib
+	cp /lib/libnss_files.so.2 /hive/share/S9/lib/libnss_files.so.2
+	sed -i "s/\/etc\/hosts/\/tmp\/hosts/" /hive/share/S9/lib/libnss_files.so.2
+
+	if (( ! IS_ASIC_CUSTOM_FW )); then
+		echo_x action 'Patching upgrade'
+		cd /www/pages/cgi-bin/ || echo_x error 'Cannot change directory'
+		patch -p10 /www/pages/cgi-bin/upgrade.cgi < /hive/share/S9/upgrade.cgi.patch
+	fi
+	sed -i '/\#\#\# HIVE HECK \#\#\#/,$d' /config/network.conf
+	if [[ -d /hive-config && ! -L /hive-config ]]; then
+		mkdir -p /config/hive/hive-config
+		mv -f /hive-config /config/hive/
+		ln -s /config/hive/hive-config/ /hive-config
+	fi
+#	#ramdisk
+#	if ! mount | grep ramdisk > /dev/null; then
+#		mkdir -p /mnt/ramdisk
+#		mount -t tmpfs -o size=100m tmpfs /mnt/ramdisk
+#	fi
+elif [[ $ASIC_MODEL =~ "Antminer T17" || $ASIC_MODEL =~ "Antminer S17" || $ASIC_MODEL =~ "Antminer X17" || $ASIC_MODEL =~ "Antminer S19" || $ASIC_MODEL =~ "Antminer T19" ]]; then
+	#echo_x action 'Applying crontab'
+	#nohup /hive/sbin/bash -c 'sleep 60; /hive/bin/cron1' > /dev/null 2>&1 &
+	#nohup /hive/sbin/bash -c 'sleep 60; /hive/bin/cron2' > /dev/null 2>&1 &
+	[ ! -f "/bin/cmp" ] && ln -s /hive/sbin/busybox.nosuid /bin/cmp
+	[ ! -f "/bin/nc" ] && ln -s /hive/sbin/busybox.nosuid /bin/nc
+	[ ! -f "/bin/nslookup" ] && ln -s /hive/sbin/busybox.nosuid /bin/nslookup
+	[ ! -f "/bin/renice" ] && ln -s /hive/sbin/busybox.nosuid /bin/renice
+	[ ! -f "/bin/free" ] && ln -s /hive/sbin/busybox.nosuid /bin/free
+	[ ! -f "/bin/time" ] && ln -s /hive/sbin/busybox.nosuid /bin/time
+	[ ! -f "/bin/uptime" ] && ln -s /hive/sbin/busybox.nosuid /bin/uptime
+	[ ! -f "/bin/gzip" ] && ln -s /hive/sbin/busybox.nosuid /bin/gzip
+	ln -sf /hive/sbin/busybox.nosuid /bin/ip
+
+	#hosts patch
+	touch /tmp/hosts
+	export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/hive/share/S9/lib
+	cp /lib/libnss_files.so.2 /hive/share/S9/lib/libnss_files.so.2
+	sed -i "s/\/etc\/hosts/\/tmp\/hosts/" /hive/share/S9/lib/libnss_files.so.2
+
+	# enable dmesg timestaps
+	echo_x action 'Enabling kernel log timestamps'
+	echo 'Y' > /sys/module/printk/parameters/time
 fi
 
 
-echo2 "> Caching host resolve"
+# [TEST] enable MTU autodetect
+echo_x action 'Enabling Path MTU Discovery'
+enable_mtu_autodetect
+
+
+# [TEST] disable avahi-daemon
+if [[ "$ASIC_MODEL" == 'Antminer'* ]]; then
+	echo_x action 'Stopping Avahi daemon'
+	disable_avahi_daemon
+fi
+
+
+echo_x action 'Installing udhcpc helper'
+dns-helper install renew --verbose --pretty
+
+
+echo_x action 'Caching a host resolve for the API server'
 cache-hive-ip
 
-echo2 "> Saying hello to server"
+
+# https
+if is_https_supported; then
+	echo_x ok 'HTTPS support' 'OK'
+	set_https_semaphore_file
+else
+	echo_x warning 'HTTPS' 'not supported'
+fi
+
+echo_x action 'Fetching an actual time from the server'
+get_datetime_from_server
+
+
+echo_x action 'Saying hello to the server'
 hello boot
-[[ -e $RIG_CONF ]] &&
-	. $RIG_CONF #will be needed to start WD later
+hello_exitcode=$?
+if (( hello_exitcode != 0 )); then
+	echo_x warning "hello failed with exitcode $hello_exitcode (it's ok in some cases like the first launch after an upgrade)"
+	if (( hello_exitcode > 1 )); then
+		# '> 1' do mean numerous curl errors
+		echo_x action 'Detaching hello to a background screen session (until the successful connect)'
+		screen -dmS 'trying_to_say_hello' /hive/sbin/bash -c \
+			'c=0; until hello boot; do printf "\n> hello failed with exitcode %u (attempt #%u), waiting 60s...\n" $? $(( ++c )); sleep 60; done |& tee /tmp/hello-boot.log'
+	fi
+fi
 
 
+[[ -s "$RIG_CONF" ]] && source "$RIG_CONF" # should be reloaded after hello, will be needed to start our WD later
 
-echo2 "> Starting agent screen"
+
+echo_x action 'Starting agent screen session'
 agent-screen dontattach
 
 
-#bmminer is autostarted after in /etc/rcS.d
-#echo2 "> Starting miner"
-#miner start
+# controller
+echo_x action 'Starting controller'
+kill_all 'controller'
+{
+	#
+	# fix "controller log is too big, /config dir is too small, no space left" issue, rough -- should refactor later
+	#
+	# consts
+	declare -r deprecated_controller_log='/config/hive-controller.log'
+	declare -r -i controller_log_lines_lower_limit=1000
+	declare -r -i controller_log_lines_upper_limit=2000
+	# vars
+	declare this_nvram_directory controller_log="$deprecated_controller_log"
+	declare -i controller_log_lines_count=0
+	declare controller_log_truncated_to_limit=''
+	# code
+	for this_nvram_directory in '/nvdata' '/opt' '/config'; do
+		if is_directory_exist_and_writable "$this_nvram_directory"; then
+			controller_log="$this_nvram_directory/client-controller.log"
+			# check for log at the deprecated path/name
+			if [[ -f "$deprecated_controller_log" ]]; then
+				echo_x action "Renaming an old controller's log to $controller_log"
+				mv -f "$deprecated_controller_log" "$controller_log"
+			fi
+			break
+		fi
+	done
+
+	# sponge the log to save the space
+	if [[ -s "$controller_log" ]]; then
+		if controller_log_lines_count="$( wc -l < "$controller_log" )" && (( controller_log_lines_count > controller_log_lines_upper_limit )); then
+			echo_x action "$controller_log exceeded $controller_log_lines_upper_limit lines, truncating to the last $controller_log_lines_lower_limit lines"
+			controller_log_truncated_to_limit="$( tail -n "$controller_log_lines_lower_limit" "$controller_log" )"
+			echo "$controller_log_truncated_to_limit" > "$controller_log"
+		fi
+	fi
+}
+nohup /hive/bin/controller >> "$controller_log" 2>&1 & disown # disown is esp. for Innosilicon smart-ass
+
+
+# averager service is turned out temporarily, as of August 2021
+averager stop
+#echo_x action 'Starting averager'
+#averager restart
+
+
+echo_x action 'Generating miner config'
 /hive/bin/miner config-gen
 
 
-echo2 "> Hive Start Finished"
+# motd
+echo
+/hive/etc/motd
+
+
+# mission complete
+echo_x ok 'The Client start finished' 'OK'
+
+
 exit 0

@@ -1,94 +1,364 @@
 #!/bin/sh -e
 
-export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/hive/bin:/hive/sbin
-#set -e
 
-rm -rf /config/hive/hive
-rm -rf /hive
+#
+# Copyright (C) 2016-2020  Hiveon
+# Distributed under GNU GENERAL PUBLIC LICENSE 2.0
+# License information can be found in the LICENSE file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
 
-file=/tmp/$$
-mkdir $file
-cd $file
-URL="$1"
-#curl "$URL" | tar xvz
-filename=$(echo $URL | awk -F \/ '{print $NF}')
-FARM_HASH=$(echo $filename | awk -F \- '{print $NF}' | sed s/.tar.gz//)
-HIVE_HOST_URL=$(echo $URL | grep 'http://download' | grep 'os' | grep '/asic/' | awk -F \/asic '{print $1}' | sed s/'http:\/\/download'/'http:\/\/api'/)
 
-trap atexit 0
+readonly script_mission='Client for ASICs: Antminer Firmware Upgrade'
+readonly script_version='0.1.23'
+readonly script_basename="${0##*/}"
 
-atexit() {
-        rm -rf $file
-        umount $file.boot 2>/dev/null || true
-        rmdir $file.boot 2>/dev/null || true
-        sync
-        if [ ! $ok ]; then
-            echo -e "System upgrade failed"
-        fi
+
+# !!! sh -e
+
+
+# functions
+
+print_script_version () {
+	echo -e "${YELLOW}${script_mission}, version ${script_version}${NOCOLOR}"
+	echo
 }
 
-#exec 2>/tmp/upgrade_result
+print_script_usage () {
+	echo -e "  Usage: ${CYAN}${script_basename} firmware-package-URL${NOCOLOR}"
+	echo
+	echo '  Firmware package, stock ot custom, must be in .tar.gz format'
+	echo
+}
 
-#tar zxf -
-#tar -xvf "$filename"
-curl "$URL" | tar xvz
-if [ ! -f ubi_info ]; then
-    echo -e "${RED}Incorrect firmware!!!${NOCOLOR}"
-    rm /tmp/*
-    exit 1
-else
+hide_certs () {
+	# hide upgrade scripts, version file and certificates
+	echo '> Disabling cert protection...'
+	for this_file in /www/pages/cgi-bin/upgrade.cgi /www/pages/cgi-bin/upgrade2.cgi /www/pages/cgi-bin/upgrade_clear.cgi \
+					/etc/ant_version /etc/bitmain-pub.pem /etc/msk-pub.pem; do
+		if [ -f "$this_file" ]; then
+			mv -f "$this_file" "${this_file}-disabled" || true
+		fi
+	done
+	is_certs_hidden=1
+}
 
-if [ ! -d /mnt/config ];
-then
-    mkdir /mnt/config
-fi
+unhide_certs () {
+	# unhide upgrade scripts, version file and certificates
+	if [ "$is_certs_hidden" -eq 1 ]; then
+		echo '> Enabling cert protection...'
+		for this_file in /etc/ant_version /etc/bitmain-pub.pem /etc/msk-pub.pem \
+						 /www/pages/cgi-bin/upgrade.cgi /www/pages/cgi-bin/upgrade2.cgi \
+						 /www/pages/cgi-bin/upgrade_clear.cgi; do
+			if [ -f "${this_file}-disabled" ]; then
+				mv -f "${this_file}-disabled" "$this_file" || true
+			fi
+		done
+		is_certs_hidden=0
+	fi
+}
 
-ubiattach /dev/ubi_ctrl -m 2
-mount -t ubifs ubi1:rootfs /mnt/config
+at_exit () {
+	echo "> Removing temporary directory $directory_to_unpack_fw..."
+	rm -rf "${directory_to_unpack_fw:-SAFE}" # "rm -rf some_file || true" has no sense because rm with -f argument never returns anything but 0
+	umount "$directory_to_unpack_fw.boot" 2>/dev/null || true
+	rmdir "$directory_to_unpack_fw.boot" 2>/dev/null || true
+	unhide_certs
+	sync
+	if [ -z "$ok" ]; then
+		echo -e "! ${BRED}Firmware upgrade unexpectedly interrupted${NOCOLOR}"
+		if [ -s /tmp/upgrade_result ]; then
+			echo '> runme.sh log:'
+			cat /tmp/upgrade_result
+			rm -rf /tmp/upgrade_result
+		fi
+		if [ -s "$error_log" ]; then
+			echo '> Error log:'
+			cat "$error_log"
+			rm -rf "${error_log:-SAFE}"
+		fi
+	fi
+	echo '> Exiting'
+}
 
-if [ ! -d /mnt/config/home/usr_config ]
-then
-    mkdir /mnt/config/home/usr_config
-fi
+do_upgrade_for () {
+	# args
+	local upgrade_type="$1"
 
-sed -i '/\#\#\# HIVE HECK \#\#\#/,$d' /config/network.conf
+	# consts
+	directory_to_unpack_fw_ROOT="/tmp/${script_basename}-download"
+	directory_to_unpack_fw="${directory_to_unpack_fw_ROOT}-${$}"
 
-cat >> /config/network.conf <<FILEEOF
+	# code
+	echo "> Upgrading firmware for $ASIC_MODEL..."
 
-### HIVE HECK ###
-if [ ! -L /hive-config ] && [ ! -e /hive-config ] && [ -d /config/hive ]; then
-  ln -s /config/hive/hive-config /hive-config
-  export PATH=$PATH:/hive/bin:/hive/sbin
-  export LD_LIBRARY_PATH=/hive/lib
-  cp -rf /hive/share/S9/S69hive /etc/rcS.d/
-  cp -rf /hive/share/S9/.profile /home/root/
-  /hive/bin/hive
-fi
-FILEEOF
+	# check for .tar.gz extension
+	firmware_filename="$( echo "$URL" | awk -F \/ '{print $NF}' )"
+	if ! { echo "$firmware_filename" | grep -q '.tar.gz'; }; then
+		echo -e "! ${BYELLOW}Firmware's filename does not contain '.tar.gz', trying anyway...${NOCOLOR}"
+	fi
 
-if [ $(echo $FARM_HASH | wc -c) -eq 41 ]; then
-        echo $FARM_HASH > /config/FARM_HASH
-fi
-if [ ! -z $HIVE_HOST_URL ]; then
-        echo $HIVE_HOST_URL > /config/HIVE_HOST_URL
-fi
+	# get FARM_HASH from a firmware's filename
+	FARM_HASH="$( echo "$firmware_filename" | awk -F \- '{print $NF}' | sed s/.tar.gz// )"
 
-sync
+	# get HIVE_HOST_URL from a firmware's filename
+	HIVE_HOST_URL="$( echo "$URL" | grep 'http://download' | grep 'os' | grep '/asic/' | awk -F \/asic '{print $1}' | sed s/'http:\/\/download'/'http:\/\/api'/ )"
 
-cp -r /config/* /mnt/config/home/usr_config/
-umount /mnt/config
-ubidetach -d 1 /dev/ubi_ctrl
+	# remove temp downloads from previous runs
+	rm -rf "${directory_to_unpack_fw_ROOT:-SAFE}"*
 
-if [ -f runme.sh ]; then
-        sh runme.sh
-        echo -e "${GREEN}Firmware upgrade complete. Rebooting...${NOCOLOR}"
-else
-    echo -e "${RED}Incorrect firmware!!!${NOCOLOR}"
-    exit 1
-fi
-fi
+	# remove huge temp files/directories (1M and up)
+	for this_huge_file in $( du -h /tmp/* /var/log/* | awk '/^[0-9.]+M/{print $2}' ); do
+		echo "> Clearing the space, removing $this_huge_file (it's greater than 1M)..."
+		rm -rf "${this_huge_file:-SAFE}"
+	done
 
-#cat /tmp/upgrade_result
+	# create a temp dir
+	echo "> Creating temporary directory $directory_to_unpack_fw..."
+	mkdir "$directory_to_unpack_fw"
+	cd "$directory_to_unpack_fw"
+	trap at_exit EXIT
 
-sleep 1; /sbin/reboot -f
+	# drop caches
+	sync && echo 3 > /proc/sys/vm/drop_caches
 
+	# liftoff!
+	"upgrade_$upgrade_type"
+}
+
+download_and_unpack () {
+	# vars
+	local attempt_counter=1
+	local max_attempts=20
+	local is_unpacked_ok_FLAG=1
+
+	# code
+	echo "> Downloading and unpacking $firmware_filename..."
+	until curl --silent --insecure --location --show-error --connect-timeout 15 "$URL" | tar xvz; do
+		echo -e "! ${BRED}Downloading and unpacking FAIL (attempt $attempt_counter/$max_attempts)${NOCOLOR}"
+		rm -rf "${directory_to_unpack_fw:-SAFE}/"* # remove half-downloaded files for every attempt
+		if [ "$attempt_counter" -ge "$max_attempts" ]; then
+			is_unpacked_ok_FLAG=0
+			break
+		fi
+		sleep "$attempt_counter"
+		: $(( attempt_counter += 1 ))
+	done
+
+	if [ "$is_unpacked_ok_FLAG" -eq 1 ]; then
+		echo '> Downloaded and unpacked OK, going further...'
+	else
+		echo -e "! ${BRED}No attempts left ($attempt_counter/$max_attempts)${NOCOLOR}"
+		false # to exit immediately
+	fi
+}
+
+upgrade_L3 () {
+	download_and_unpack
+
+	if [ -f runme.sh ]; then
+		echo '> Executing runme.sh...'
+		sh runme.sh
+		echo '> runme.sh finished'
+	else
+		if [ -e /dev/mmcblk0p3 ]; then
+			mkdir "$directory_to_unpack_fw.boot"
+			mount /dev/mmcblk0p1 "$directory_to_unpack_fw.boot"
+			cp -rf ./* "$directory_to_unpack_fw.boot/"
+			umount "$directory_to_unpack_fw.boot"
+			sync
+		fi
+		if [ -e /dev/mtd8 ]; then
+			if [ -f initramfs.bin.SD ]; then
+				echo '> Flashing romfs...'
+				flash_eraseall /dev/mtd8 >/dev/null 2>&1
+				nandwrite -p /dev/mtd8 initramfs.bin.SD >/dev/null 2>&1
+			fi
+
+			if [ -f uImage.bin ]; then
+				echo '> Flashing kernel...'
+				flash_eraseall /dev/mtd7 2>/dev/null
+				nandwrite -p /dev/mtd7 uImage.bin 2>/dev/null
+			fi
+		fi
+	fi
+
+	ok=1
+	echo
+	echo -e "> ${BGREEN}Flashing complete. Rebooting...${NOCOLOR}"
+
+	sleep 1
+	/sbin/reboot -f
+}
+
+upgrade_S9 () {
+#	rm -rf /config/hive/hive
+#	rm -rf /hive ## no longer needed after cleaning /tmp
+	for this_directory in /tmp/*; do
+		# remove all dirs in /tmp that are not links
+		if [ -d "$this_directory" ] && [ ! -L "$this_directory" ]; then
+			case "$this_directory" in
+				"$directory_to_unpack_fw"	)		: skip										;;
+				'/tmp/screens'				)		: skip										;;
+				*							)		echo "[DEBUG] Removing $this_directory..."
+													rm -rf "${this_directory:-SAFE}"			;;
+			esac
+		fi
+	done
+
+	download_and_unpack
+
+	if [ ! -f ubi_info ]; then
+		echo -e "! ${BRED}Incorrect firmware (no 'ubi_info' found)${NOCOLOR}"
+		#rm -rf /tmp/* # don't have to do this bc we have at_exit destructor that'll take care of everything
+		exit 1
+	else
+		if [ ! -d /mnt/config ]; then
+			mkdir /mnt/config
+		fi
+		ubiattach /dev/ubi_ctrl -m 2
+		mount -t ubifs ubi1:rootfs /mnt/config
+		if [ ! -d /mnt/config/home/usr_config ]; then
+			mkdir /mnt/config/home/usr_config
+		fi
+
+		sed -i '/\#\#\# HIVE HECK \#\#\#/,$d' /config/network.conf
+		cat >> /config/network.conf <<-FILEEOF
+			### HIVE HECK ###
+			if [ ! -L /hive-config ] && [ ! -e /hive-config ] && [ -d /config/hive ]; then
+			    ln -s /config/hive/hive-config /hive-config
+			    case "\$PATH" in
+			        *'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+			        *)							export PATH="\$PATH:/hive/bin:/hive/sbin"	;;
+			    esac
+			    export LD_LIBRARY_PATH=/hive/lib
+			    cp -rf /hive/share/S9/S69hive /etc/rcS.d/
+			    cp -rf /hive/share/S9/.profile /home/root/
+			    /hive/bin/hive
+			fi
+		FILEEOF
+
+		if [ "${#FARM_HASH}" -eq 40 ]; then
+			echo "$FARM_HASH" > /config/FARM_HASH
+		fi
+		if [ -n "$HIVE_HOST_URL" ]; then
+			echo "$HIVE_HOST_URL" > /config/HIVE_HOST_URL
+		fi
+		sync
+		cp -r /config/* /mnt/config/home/usr_config/
+		umount /mnt/config
+		ubidetach -d 1 /dev/ubi_ctrl
+		if [ -f runme.sh ]; then
+			hide_certs
+			echo '> Executing runme.sh...'
+			sh runme.sh
+			echo '> runme.sh finished'
+			echo -e "> ${BGREEN}Firmware upgrade complete. Rebooting...${NOCOLOR}"
+		else
+			echo -e "! ${BRED}Incorrect firmware (no 'runme.sh' found)${NOCOLOR}"
+			exit 1
+		fi
+	fi
+
+	#cat "$error_log"
+	ok=1
+	sleep 1
+	/sbin/reboot -f
+}
+
+upgrade_ro () {
+	# models with read-only fs
+	[ -e /nvdata/latest.tar.gz ] && rm -rf /nvdata/latest.tar.gz
+
+	exec 2>"$error_log" # redirect stderr to file
+
+	# save FARM_HASH to the corresponding file
+	if [ "${#FARM_HASH}" -eq 40 ]; then
+		echo "$FARM_HASH" > /config/FARM_HASH
+	fi
+
+	# save HIVE_HOST_URL to the corresponding file
+	if [ -n "$HIVE_HOST_URL" ]; then
+		echo "$HIVE_HOST_URL" > /config/HIVE_HOST_URL
+	fi
+
+	download_and_unpack
+	sync
+
+	hide_certs
+	echo '> Executing runme.sh...'
+	sh runme.sh
+	echo '> runme.sh finished'
+
+	if [ ! -s "$error_log" ]; then
+		echo -e "> ${BGREEN}Firmware upgrade complete. Rebooting in 20 seconds...${NOCOLOR}"
+		# TODO should we fork the reboot to bg? so the agent can send a message to server?
+		sleep 20
+		sh /www/pages/cgi-bin/reboot.cgi || { sleep 5; /sbin/reboot -f; }
+	else
+		cat "$error_log"
+	fi
+
+	ok=1
+}
+
+
+# consts
+
+readonly error_log="/tmp/$script_basename.log"
+
+
+# vars
+
+is_certs_hidden=0
+
+
+# sources
+
+[ -f /hive/bin/colors ] && . colors
+
+
+# main
+
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/hive/bin:/hive/sbin
+[ -f /usr/bin/compile_time ] && ASIC_MODEL="$( sed -n 2p /usr/bin/compile_time )" # Antminer model
+
+print_script_version
+
+case "$1" in
+	''|'-h'|'--help')
+		print_script_usage
+		exit
+	;;
+
+	'http://'*|'https://'*)
+		URL="$1"
+	;;
+
+	*)
+		print_script_usage
+		exit 1
+	;;
+esac
+
+case "$ASIC_MODEL" in
+	'Antminer S9'*		|\
+	'Antminer T9'*		|\
+	'Antminer S10'*)	do_upgrade_for 'S9'	;;
+
+	'Antminer S9k'*		|\
+	'Antminer S9SE'*	|\
+	'Antminer S15'*		|\
+	'Antminer S17'*		|\
+	'Antminer T15'*		|\
+	'Antminer T17'*		|\
+	'Antminer S19'*		|\
+	'Antminer T19'*		|\
+	'Antminer X17'*)	do_upgrade_for 'ro'	;;
+
+	'Antminer L3'*)		do_upgrade_for 'L3'	;;
+
+	*)
+		echo -e "${BRED}$ASIC_MODEL not supported, exiting...${NOCOLOR}"
+		exit 1
+	;;
+esac

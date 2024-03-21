@@ -1,20 +1,446 @@
 #!/hive/sbin/bash
-# !!! also can be started from cron and on startup !!!
-export PATH=$PATH:/hive/bin:/hive/sbin
-export LD_LIBRARY_PATH=/hive/lib
 
 
+#
+# Copyright (C) 2017  Hiveon Holding LTD
+# Distributed under Business Source License 1.1
+# License information can be found in the LICENSE.txt file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
 
-screen -ls agent | grep -q agent && running=1 || running=0
 
-[[ $1 != "dontattach" ]] &&
-	screen -x -S agent #attach to screen
+readonly script_mission='Client for ASICs: agent-screen helper'
+readonly script_version='1.1.8'
+readonly script_basename="${0##*/}"
+readonly script_DEBUG="${script_DEBUG:-0}" # use value from env if exists
+#
+source /hive/bin/hive-functions.sh || { echo 'ERROR: /hive/bin/hive-functions.sh not found'; exit 1; }
 
-[ $running -ne 1 ] &&
-	echo "Starting new agent screen session" &&
-	screen -dm -S agent "agent" &&
-	exit 1 #was not running, starting
 
-#    screen -dm -S agent bash -c "agent; bash"
+#
+# !!! also can be started from 1) cron/selfupgrade/controller and 2) on startup !!!
+#
 
-exit 0 #all was running
+
+# !!! bash strict mode, no unbound variables
+#set -o nounset # commented out for production bc still not tested thoroughly
+
+
+# functions
+
+
+# functions: infra
+
+function who_am_i {
+	# ??? move to the library
+	#
+	# whoami in pure bash
+	#
+
+	# code
+	: \\u
+	printf '%s\n' "${_@P}"
+}
+
+function is_root {
+	# ??? move to the library
+
+	[[ "$( who_am_i )" == 'root' ]]
+}
+
+
+# functions: screen
+
+function screen_get_full_session_name {
+	#
+	# Usage: get_full_session_name 'session name' -> $?
+	#
+	# !!! NOT USED ATM
+	
+	# args
+	(( $# == 1 )) || { errcho 'only 1 argument allowed'; return $(( exitcode_ERROR_IN_ARGUMENTS )); }
+	local -r session_name="${1-}"
+
+	# consts
+	local -r screen_dir_1='/tmp/screens'
+	local -r screen_dir_2='/var/run/screen'
+
+	# vars
+	local user full_name_with_path
+
+	# code
+	if [[ -d "$screen_dir_1" ]]; then
+		screen_dir="$screen_dir_1"
+	elif [[ -d "$screen_dir_2" ]]; then
+		screen_dir="$screen_dir_2"
+	else
+		return 1
+	fi
+
+	user="$( who_am_i )"
+	# shellcheck disable=SC2125
+	# bc we need a glob right here
+	full_name_with_path="${screen_dir}/S-${user}/"*"${session_name}"
+
+	if [[ "$full_name_with_path" != *'*'* ]]; then
+		# no glob char left -> the path was expanded -> the session file was found
+		echo "${full_name_with_path##*/}"
+	fi
+}
+
+function screen_attach_to_session {
+	#
+	# Usage: screen_attach_to_session 'session name'
+	#
+
+	# args
+	(( $# == 1 )) || { errcho 'only 1 argument allowed'; return $(( exitcode_ERROR_IN_ARGUMENTS )); }
+	local -r session_name="${1-}"
+
+	# code
+	if is_screen_session_exist "$session_name"; then
+		#TERM='vt102' screen -x -S "$session_name" # why so complex?
+		screen -x -S "$session_name"
+	else
+		errcho "'$session_name' hasn't been started. Weird..."
+	fi
+}
+
+function screen_start_session {
+	#
+	# Usage: screen_start_session 'cmd' [args...]
+	#
+
+	# args
+	(( $# > 0 )) || { errcho 'no arguments given'; return $(( exitcode_ERROR_IN_ARGUMENTS )); }
+	local -r cmd="${1-}"
+	local -r args="${*:2}"
+
+	# consts
+	local -r session_name="$cmd"
+	local -r -i retries_limit=100
+	local -r -i scrollback_buffer_lines=300
+
+	# vars
+	local -i retries_counter
+	local -i function_exitcode=$(( exitcode_OK ))
+
+	# code
+	if ! is_program_in_the_PATH "$cmd"; then
+		errcho "cannot locate command '$cmd' to run in the screen session"
+		return $(( exitcode_ERROR_CMD_NOT_FOUND ))
+	fi
+
+	retries_counter=1
+	until is_screen_session_exist "$session_name"; do
+		screen -dm -S "$session_name" -h "$scrollback_buffer_lines" "$cmd" $args
+
+		if (( retries_counter > 1 )); then
+			snore 1 # sometimes gnu screen is slow
+			#screen -wipe # > /dev/null # let's debug
+		#else
+			# skip 'sleep' at the first iteration
+		fi
+
+		(( retries_counter == 2 )) && printf '\n'
+
+		if (( retries_counter % 10 == 0 )); then
+			if [[ -t 1 ]]; then
+				printf '\rWaiting for %s screen session to start, attempt #%d... ' "$session_name" "$retries_counter"
+			else
+				printf 'Waiting for %s screen session to start, attempt #%d... \n' "$session_name" "$retries_counter"
+			fi
+		fi
+
+		if (( retries_counter >= retries_limit )); then
+			[[ -t 1 ]] && printf '\n'
+			errcho "'$session_name' hasn't been started. Weird..."
+			# debug
+			ls -ALl /var/run/screens
+			screen -ls
+			# shellcheck disable=SC2009
+			# bc we don't have pgrep
+			ps w | grep "[${session_name::1}]${session_name:1}" # surround the first char in [b]rackets, neat
+			#
+			(( function_exitcode = exitcode_ERROR_SOMETHING_WRONG ))
+			break
+		fi
+
+		(( retries_counter++ ))
+	done
+
+	return $(( function_exitcode ))
+}
+
+function screen_stop_session {
+	#
+	# Usage: screen_stop_session 'session name' -> $?
+	#
+
+	# args
+	(( $# > 0 )) || { errcho 'no arguments given'; return $(( exitcode_ERROR_IN_ARGUMENTS )); }
+	local -r session_name="${1-}"
+
+	# consts
+	local -r ctrl_c_keystroke=$'\cc'
+	local -r -i retries_limit=100
+
+	# vars
+	local -i retries_counter
+	local -i function_exitcode=$(( exitcode_OK ))
+
+	# code
+	retries_counter=1
+	while is_screen_session_exist "$session_name"; do
+		# send SIGTERM to the process
+		screen -S "$session_name" -p 0 -X stuff "$ctrl_c_keystroke"
+		snore 0.2
+		# are you still alive?
+		if is_screen_session_exist "$session_name"; then
+			screen -S "$session_name" -p 0 -X quit # doesn't work when a process in this session DO handle SIGHUP itself
+		fi
+
+		if (( retries_counter > 1 )); then
+			snore 1 # sometimes gnu screen is slow
+		#else
+			# skip sleep at the first iteration
+		fi
+
+		(( retries_counter == 2 )) && printf '\n'
+
+		if (( retries_counter % 10 == 0 )); then
+			if [[ -t 1 ]]; then
+				printf '\rWaiting for %s screen session to stop, attempt #%d... ' "$session_name" "$retries_counter"
+			else
+				printf 'Waiting for %s screen session to stop, attempt #%d... \n' "$session_name" "$retries_counter"
+			fi
+			#rm -rf /var/run/screens/*."$session_name"
+			#screen -wipe # > /dev/null # let's debug
+		fi
+
+		if (( retries_counter >= retries_limit )); then
+			[[ -t 1 ]] && printf '\n'
+			errcho "cannot stop '$session_name' in $retries_limit attempts. Zombie screen session?"
+			{
+				# debug
+				ls -ALl /var/run/screens
+				screen -ls
+				# shellcheck disable=SC2009
+				# bc we don't have pgrep
+				ps w | grep "[${session_name::1}]${session_name:1}" # surround the first char in [b]rackets, neat
+			} | tee >( message warning 'agent screen session goes zombie, please contact support (and do not erase this message, then)' --payload )
+			#
+			(( function_exitcode = exitcode_ERROR_SOMETHING_WRONG ))
+			break
+		fi
+
+		(( retries_counter++ ))
+	done
+
+	return $(( function_exitcode ))
+}
+
+
+# functions: agent
+
+function agent_start {
+	# args
+	local -r message_mode="${1-}"
+
+	# code
+	if ! is_screen_session_exist 'agent'; then
+		echo -n "${script_basename}> Starting agent... "
+		screen_start_session 'agent' && echo 'Started.' || printf '\n%s: %s\n' "$script_basename" 'Session starting error'
+	else
+		if [[ $message_mode != '--quiet-ok' ]]; then
+			echo "${script_basename}: Agent is already running"
+		fi
+	fi
+}
+
+function agent_stop {
+	if is_screen_session_exist 'agent'; then
+		echo -n "${script_basename}> Stopping agent... "
+		screen_stop_session 'agent' && echo 'Stopped.' || printf '\n%s: %s\n' "$script_basename" 'Session stopping error'
+	else
+		echo "${script_basename}: Agent hasn't been running"
+	fi
+}
+
+function agent_restart {
+	echo "${script_basename}> Restarting agent"
+	agent_stop
+	agent_start
+}
+
+function is_agent_doing_well {
+	# !!! NOT USED ATM
+	# !!! NOT TESTED ATM
+	#
+	# just bunch of asserts
+	#
+
+	# consts
+	local -r khs_FILE='/run/hive/khs'
+	local -r khs_file_age_limit_in_s=60 # 1 min
+
+	# flags
+	local -i is_agent_process_present_FLAG=0 is_agent_session_present_FLAG=0 is_khs_file_relevant_FLAG=0
+
+	# vars
+	local -i the_now_in_s=0 khs_file_last_modified_time_in_s=0 khs_file_age_in_s=0 
+
+	# code
+	# assert 1: the agent process is active
+	ps -o ppid,pid,comm,args | top
+	###
+
+	# assert 2: the agent session does exist
+	is_screen_session_exist 'agent' && is_agent_session_ok_FLAG=1
+
+	# assert 3. khs file is up-to-date (last modified no more than 1 minute ago)
+	if [[ -s "$khs_FILE" ]]; then
+		set_variable_to_current_system_time_in_seconds 'the_now_in_s'
+		khs_file_last_modified_time_in_s="$( get_file_last_modified_time_in_seconds "$khs_FILE" )"
+		(( khs_file_age_in_s = the_now_in_s - khs_file_last_modified_time_in_s ))
+
+		if (( khs_file_age_in_s > khs_file_age_limit_in_s )); then
+			is_khs_file_relevant_FLAG=1
+		fi
+	fi
+
+	# the final decision
+	(( is_agent_process_present_FLAG && is_agent_session_present_FLAG && is_khs_file_relevant_FLAG ))
+}
+
+function agent_log {
+	# consts
+	local -r -i empty_log_retries=10
+
+	# vars
+	local -i retries_counter=0
+	local -i function_exitcode
+
+	# code
+	if ! is_screen_session_exist 'agent'; then
+		# is the agent session alive? if not -- start it
+		agent_start
+		snore 2 # wait a few seconds to accumulate some data for log
+		(( function_exitcode = exitcode_OK_NOT_RUNNING_STARTED ))
+	else
+		(( function_exitcode = exitcode_OK_RUNNING ))
+	fi
+
+	# try to write to the log
+	if ! touch "$agent_log_FILE" 2> /dev/null; then
+		errcho "cannot write log to $agent_log_FILE (/tmp is read-only?)"
+		return $(( exitcode_ERROR_SOMETHING_WRONG ))
+	else
+		echo '[DEBUG] log file created'
+	fi
+
+	# set window width -- need this in the case where this terminal hasn't been attached ever
+	if ! screen -S 'agent' -p 0 -X width 300; then # > /dev/null 2>&1; then
+		errcho 'screen error (session not found?)'
+		return $(( exitcode_ERROR_SOMETHING_WRONG ))
+	else
+		echo '[DEBUG] terminal width set to 300'
+	fi
+
+	# try to produce the log
+	if ! screen -S 'agent' -p 0 -X hardcopy -h "$agent_log_FILE"; then # > /dev/null 2>&1; then
+		errcho 'screen error (session not found?)'
+		return $(( exitcode_ERROR_SOMETHING_WRONG ))
+	else
+		echo '[DEBUG] hardcopy produced'
+	fi
+
+	# does the log exist?
+	if [[ ! -f "$agent_log_FILE" ]]; then
+		errcho "screen didn't produce no log"
+		return $(( exitcode_ERROR_SOMETHING_WRONG ))
+	else
+		echo '[DEBUG] log file does exist'
+	fi
+
+	# isn't it empty? the screen can be a bit slow sometimes
+	until [[ -s "$agent_log_FILE" ]]; do
+		if (( ++retries_counter >= empty_log_retries )); then
+			errcho "screen has been produced an empty log in $empty_log_retries retries"
+			rm "$agent_log_FILE"
+			return $(( exitcode_ERROR_SOMETHING_WRONG ))
+		fi
+		echo '[DEBUG] log file is still empty...'
+		snore 0.1 # it's pretty enough
+	done
+
+	echo "[DEBUG] there are $( sed '/[^[:blank:]]/,$!d' <<< "$( < "$agent_log_FILE" )" | wc -l ) non-empty lines in the log" #'"
+
+	sed '/[^[:blank:]]/,$!d' <<< "$( < "$agent_log_FILE" )" # remove all leading and trailing blank lines (https://unix.stackexchange.com/questions/552188) 
+	rm "$agent_log_FILE"
+
+	return $(( function_exitcode ))
+}
+
+
+# global consts
+
+declare -r agent_log_FILE='/tmp/agent-hardcopy.log'
+
+
+# global enums
+
+declare -r -i exitcode_OK_RUNNING=0
+declare -r -i exitcode_OK_NOT_RUNNING_STARTED=1
+declare -r -i exitcode_ERROR_SOMETHING_WRONG=2
+declare -r -i exitcode_ERROR_CMD_NOT_FOUND=100
+
+
+# global vars
+
+declare -i script_exitcode	# exitcode_OK_RUNNING | exitcode_OK_NOT_RUNNING_STARTED | exitcode_ERROR_SOMETHING_WRONG
+
+
+# global exports
+
+[[ ! "$PATH" =~ (^|:)/hive/bin:/hive/sbin(:|$) ]] && export PATH="$PATH:/hive/bin:/hive/sbin" # add only if not exist
+[[ ! "$LD_LIBRARY_PATH" =~ (^|:)/hive/lib(:|$) ]] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:}/hive/lib" # save $LD_LIBRARY_PATH:/hive/share/S9/lib for hiveon
+
+
+# global traps
+
+trap -- 'errcho "SIGHUP received, ignoring..."' SIGHUP
+trap -- 'errcho "SIGTERM received, ignoring..."' SIGTERM
+
+
+# main()
+
+if ! is_root; then
+	errcho 'Not a root. Please acquire a root access first'
+	exit $(( exitcode_ERROR_SOMETHING_WRONG ))
+fi
+
+is_screen_session_exist 'agent'; (( script_exitcode = $? ))
+
+case "${1-}" in
+	'start')						agent_start				;;
+	'stop')							agent_stop				;;
+	'restart')						agent_restart			;;
+	'dontattach' | 'daemonize')		agent_start --quiet-ok	;;
+
+	'log')
+		agent_log
+		(( script_exitcode = $? ))
+	;;
+
+	'attach' | '')
+		agent_start
+		screen_attach_to_session 'agent'
+	;;
+
+	*)
+		errcho "Unknown argument '${1-}'"
+		(( script_exitcode = exitcode_ERROR_SOMETHING_WRONG ))
+	;;
+esac
+
+exit $(( script_exitcode ))

@@ -1,195 +1,1218 @@
 #!/hive/sbin/bash
-##!/usr/bin/env ash
-export PATH=$PATH:/hive/bin:/hive/sbin
-export LD_LIBRARY_PATH=/hive/lib
-
-# Sends hello to Hive, receives config files, restarts miner
-
-HELLO_OK="/tmp/.hive-hello-ok"
-[ -f $HELLO_OK ] && rm $HELLO_OK
-
-RIG_CONF="/hive-config/rig.conf"
-WALLET_CONF="/hive-config/wallet.conf"
-VPN_INSTALLED="/tmp/.openvpn-installed"
-mkdir -p "/hive-config"
-
-[ -t 1 ] && . colors
-[ ! -f $RIG_CONF ] && echo -e "No config $RIG_CONF" && exit 1
-
-. $RIG_CONF
-
-[[ -z $FARM_HASH && -z $RIG_ID ]] && echo "Please use FARM_HASH or RIG_ID in config" && exit 1
-[[ ! -z $RIG_ID  && -z $RIG_PASSWD ]] && echo "No RIG_PASSWD in config" && exit 1
-[[ -z $HIVE_HOST_URL ]] && echo "No HIVE_HOST_URL in config" && exit 1
 
 
-
-HIVE_URL="$HIVE_HOST_URL/worker/api"
-
-
-#will need to restart miner after
-arg_restartminer=0
-#send boot flag with hello message
-arg_boot=0
-arg_hostname=
-
-#check for arguments
-for var in "$@"; do
-    [[ $var == "restartminer" ]] && arg_restartminer=1
-    [[ $var == "boot" ]] && arg_boot=1
-    [[ $var == "hostname" ]] && arg_hostname=`hostname`
-done
-
-# Make hello request ================================================================
-
-boot_time=$(( `date +%s` - `cat /proc/uptime | awk '{printf "%d", $1}'` ))
-
-ips_json="[\""`ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}'`"\"]"
-net_interfaces=`ip -o link | grep -vE 'LOOPBACK|POINTOPOINT|NONE' | awk '{  printf "{\"iface\": \"%s\", \"mac\": \"%s\"}\n", substr($2, 1, length($2)-1), $(NF-2)  }' | jq -sc .`
-
-mb_manufacturer=
-#mb_product=`cat /etc/config/Config.ini | grep -m1 "Name=" | awk -F"=" '{print $2}'`
-[ -e "/usr/bin/compile_time" ] && mb_product=`sed -n 2p /usr/bin/compile_time`
-[ -e "/opt/system/bank.conf" ] && mb_product="ebit"
-[ -e "/etc/hwrevision" ] && mb_product=`cut -d\  -f 2 /etc/hwrevision`
-[ -e "/var/www/html/src/Template/Layout/signin.twig" ] && mb_product=`cat /var/www/html/src/Template/Layout/signin.twig | grep title | sed 's/<[^>]*>//g' | sed s/\ *//`
-[ -e "/tmp/type" ] && [ ! -e "/etc/hwrevision" ] && mb_product=`cat /tmp/type`.`cat /tmp/hwver`
-[ -e "/tmp/miner-info" ] && mb_product=`cat /tmp/miner-info | awk -F\- '{print $1, $2}'` #WhatsMiner
-
-cpu_model=`cat /proc/cpuinfo | grep -m1 "^model name" | sed 's/model name[ :\t]*//g'`
-[ -z $cpu_model ] && cpu_model=`cat /proc/cpuinfo | grep -m1 "^Hardware" | sed 's/Hardware[ :\t]*//g'`
-
-#cpu_hardware=`cat /proc/cpuinfo | grep -m1 "^Hardware" | sed 's/Hardware[ :\t]*//g'`
-#[[ ! -z "$cpu_hardware" ]] && cpu_model="$cpu_model ($cpu_hardware)"
-cpu_cores=`cat /proc/cpuinfo | grep "^model name" | wc -l`
-[ -z $cpu_cores ] && cpu_cores=`cat /proc/cpuinfo | grep "^processor" | wc -l`
-aes=`cat /proc/cpuinfo | grep "^Features .*aes" | wc -l`
-[ -z $aes ] && aes=`cat /proc/cpuinfo | grep "^Features" | grep "aes" | wc -l`
-
-kernel=`uname --kernel-release`
-
-hive_version=`cat /hive/etc/VERSION`
-#hive_version=`dpkg -s hive | grep '^Version: ' | sed 's/Version: //'`
-
-[ -e "/usr/bin/compile_time" ] && asic=`cat /usr/bin/compile_time | jq -R . | jq -s '{"firmware": .[0], "model": .[1], "logic_version": .[2]}'`
-[[ $mb_product =~ "Antminer D3 Blissz" ]] && asic=`cat /usr/bin/compile_time | jq -R . | jq -s '{"firmware": .[0], "model": .[1], "logic_version": "unknown"}'`
-[[ $mb_product == "b29+.g19" ]] && asic=`cat /etc/hwrevision | jq -R . | jq -s '{"firmware": .[1], "model": "Innosilicon A9", "logic_version": .[0]}'`
-[[ $mb_product == "d9.g19" ]] && asic=`cat /etc/hwrevision | jq -R . | jq -s '{"firmware": .[1], "model": "Innosilicon D9", "logic_version": .[0]}'`
-[[ $mb_product == "s11.g19" ]] && asic=`cat /etc/hwrevision | jq -R . | jq -s '{"firmware": .[1], "model": "Innosilicon S11", "logic_version": .[0]}'`
-[[ $mb_product == "Zig Z1+" ]] && asic=`cat /var/www/html/VERSION | jq -R . | jq -s '{"firmware": .[0], "model": "Zig Z1+", "logic_version": "Zig Z1+"}'`
-[[ $mb_product == "Zig Z1" ]] && asic=`cat /var/www/html/VERSION | jq -R . | jq -s '{"firmware": .[0], "model": "Zig Z1", "logic_version": "Zig Z1"}'`
-[[ $mb_product == "T4.G19" ]] && asic=`cat /tmp/type| jq -R . | jq -s '{"firmware": .[0], "model": "Innosilicon A5/A8", "logic_version": .[0]}'`
-[[ $mb_product =~ "WhatsMiner" ]] && asic=`cat /tmp/miner-info | awk -F\- '{print $7 "\n" $1, $2 "\n" $3, $4, $5, $6}' | jq -R . | jq -s '{"firmware": .[0], "model": .[1], "logic_version": .[2]}'`
-
-#asic=`cat /usr/bin/compile_time | jq -R . | jq -s '{"firmware": .[0], "model": .[1], "logic_version": "unknown"}'`
-#asic=`cat /usr/bin/compile_time | jq -R . | jq -s '{"firmware": .[0], "model": .[1]}'`
-
-#asic_chain_count=`echo /dev/fd/*/ | sed s/[^0-9]//g`
-asic_chain_count=`ls -lLtr /dev/fd/ | grep rw | wc -l`
-[[ $mb_product =~ "Zig Z1" ]] && asic_chain_count=4
-[[ $mb_product =~ "WhatsMiner" ]] && asic_chain_count=3
+#
+# Copyright (C) 2017  Hiveon Holding LTD
+# Distributed under Business Source License 1.1
+# License information can be found in the LICENSE.txt file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+# Linted by shellcheck 0.7.0 (100%)
+#
 
 
-uid=$(echo ${mb_product}-$(cat /sys/class/net/eth0/address | sed 's/://g') | tr '[:upper:]' '[:lower:]')
-if which sha1sum > /dev/null; then
-	uid=$(echo $uid | sha1sum | awk '{print $1}')
-elif which md5sum > /dev/null; then
-	uid=$(echo $uid | md5sum | awk '{print $1}')
+readonly script_mission='Client for ASICs: Say hello to the server'
+# shellcheck disable=SC2034
+# just because
+readonly script_mission_description='Sends hello to server, receives config files, restarts miner'
+readonly script_version='0.8.3'
+readonly script_basename="${0##*/}"
+#
+readonly script_DEBUG="${script_DEBUG:-0}" # use value from env if exists
+
+
+# !!! bash strict mode, no unbound variables
+#set -o nounset # commented out for production bc still not tested thoroughly
+
+
+# functions
+
+function echo_ok		{ echo -e "${LGRAY-}${script_basename}: ${BGREEN-}${*}${NOCOLOR-}"; }
+function echo_action	{ echo -e "${LGRAY-}${script_basename}> ${WHITE-}${*}...${NOCOLOR-}"; }
+function echo_info		{ echo -e "${LGRAY-}${script_basename}: ${NOCOLOR-}${*}"; }
+function echo_warning	{ echo -e "${LGRAY-}${script_basename}: ${BYELLOW-}${*}${NOCOLOR-}"; }
+function echo_debug		{ echo -e "${LGRAY-}${script_basename}: ${BPURPLE-}[DEBUG] ${*}${NOCOLOR-}"; } 1>&2
+function echo_error		{ echo -e "${RED-}${script_basename}: ${BRED-}${*}${NOCOLOR-}"; } # 1>&2 # commented temporary, for cgi-bin script
+
+function die {
+	# !!! must be the first line in this function to catch the incoming error code -- do not move
+	local -r incoming_exitcode=$?
+
+	# args
+	local -r message="$1"
+	local -r exitcode="${2:-$incoming_exitcode}"
+
+	# code
+	[[ -n "$message" ]] && echo_error "$message"
+	exit $(( exitcode ))
+}
+
+function print_script_version {
+	echo -e "${YELLOW-}${script_mission}, version ${script_version}${NOCOLOR-}"
+	echo
+}
+
+function print_script_usage {
+	echo -e "Usage: ${CYAN-}${script_basename} [--boot] [--hostname] [--workername=your_custom_worker_name] [--restartminer]${NOCOLOR-}"
+	echo
+}
+
+function parse_arguments {
+	# vars
+	local this_argument worker_name
+
+	# code
+	for this_argument in "$@"; do
+		case "$this_argument" in
+			'--boot' | 'boot' )
+				arg_boot_FLAG=1
+				echo_info '[OPTION] Boot mode ON'
+			;;
+
+			'--hostname' | 'hostname' )
+				worker_name="$( hostname )"
+				if [[ -n "$worker_name" ]]; then
+					arg_worker_name="$worker_name"
+					echo_info "[OPTION] Custom worker name '$arg_worker_name'"
+				else
+					echo_error "Cannot use an empty hostname as a worker name, assignment skipped"
+				fi
+			;;
+
+			'-w='* | '--workername='* | 'workername='* )
+				worker_name="${this_argument#*=}"
+				if [[ -n "$worker_name" ]]; then
+					arg_worker_name="${this_argument#*=}"
+					echo_info "[OPTION] Custom worker name '$arg_worker_name'"
+				else
+					echo_error "Cannot use an empty string as a worker name, assignment skipped"
+				fi
+				;;
+
+			'--restartminer' | 'restartminer' )
+				arg_restartminer_FLAG=1
+				echo_info '[OPTION] Miner will be restarted'
+			;;
+
+			'')
+				: ok good to go
+			;;
+
+			'-h'|'--help')
+				print_script_usage
+				exit 0
+			;;
+
+			*)
+				print_script_usage
+				die "Unknown argument '$this_argument', exiting..." 1
+			;;
+		esac
+	done
+}
+
+function is_https_allowed {
+	# code
+	[[ -f "$https_semaphore_flag_FILE" ]]
+}
+
+function is_JSON_string_empty_or_null {
+	# args
+	local -r JSON_string="$1"
+
+	# code
+	[[ -z "$JSON_string" || "$JSON_string" == 'null' ]]
+}
+
+function is_JSON_string_not_empty_or_null {
+	# args
+	local -r JSON_string="$1"
+
+	# code
+	[[ -n "$JSON_string" && "$JSON_string" != 'null' ]]
+}
+
+function is_interface_up {
+	# args
+	local -r if_to_check_DEFAULT='eth0'
+	local -r if_to_check="${1:-$if_to_check_DEFAULT}"
+
+	# code
+	if [[ ! -d "/sys/class/net/${if_to_check}" ]]; then
+		echo_error "No such interface '$if_to_check'"
+		return 2
+	else
+		[[ $( < "/sys/class/net/${if_to_check}/operstate" ) == 'up' ]]
+	fi
+}
+
+function rematch {
+	# actually we don't have to use pure bash eh?
+	# rematch 'regex' ['string']
+
+	# args
+	local -r regex="$1"
+	local -r string="${2:-$( </dev/fd/0 )}" # get from arg or stdin
+
+	# code
+	[[ "$string" =~ $regex ]]
+	printf '%s\n' "${BASH_REMATCH[@]:1}"
+}
+
+function jq_raw_input_then_slurp {
+	#
+	# Usage: jq_raw_input_then_slurp 'filename'|- 'JSON_template'
+	#
+
+	# args
+	local -r file="$1"
+	local -r JSON_template="$2"
+
+	# code
+	if [[ "$file" == '-' ]]; then
+		# vvvvvvvvvvvvvvvvv -- sanitize all strings to JSON for the next step (add double quotes for every line)
+		#                                 vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv -- then slurp these JSON strings to the array of strings
+		jq --raw-input '.'				| jq --slurp --compact-output "$JSON_template"
+	else
+		jq --raw-input '.' < "$file"	| jq --slurp --compact-output "$JSON_template"
+	fi
+}
+
+function file_to_json_array {
+	#
+	# Usage: file_to_json_array 'filename' ['JSON_template']
+	#        file_to_json_array - ['JSON_template'] < stdin
+	#        file_to_json_array < stdin
+	#
+
+	# args
+	local -r file="${1-}"
+	local -r JSON_template="${2-}"
+
+	# vars
+	local jq_script='split("\n")' # split input stream by newline
+
+	# code
+	if [[ -n "$JSON_template" ]]; then
+		jq_script+=" | $JSON_template | del( .[] | select( . == null or . == \"\" ) )" # TODO should I move a null removing part to the hello packet generation?
+	fi
+
+	if [[ -z "$file" || "$file" == '-' ]]; then # read from stdin
+		#    vvvvvvvvv sanitize all lines as JSON strings (add double quotes for every line)
+		jq --raw-input --slurp --compact-output "$jq_script"
+		#                ^^^^^ then slurp these JSON strings to the array of strings
+	else
+		# read from file
+		jq --raw-input --slurp --compact-output "$jq_script" < "$file"
+	fi
+}
+
+function print_JSON_with_header {
+	#
+	# Usage: print_JSON_with_header 'header' 'JSON' ['max_lines']
+	#
+
+	# args
+	local -r header="$1"
+	local -r expected_JSON="$2"
+	local -r -i max_lines_DEFAULT=20
+	local -r -i max_lines="${3:-$max_lines_DEFAULT}"
+
+	# consts
+	local -r -i last_lines_count=2
+
+	# vars
+	local checked_JSON entity_to_print color_option
+	local -i entity_bytes entity_lines=0 first_lines_count skipped_lines_count
+	local -a lines_array
+
+	# code
+
+	# color check
+	if [[ -z "${FARM_HASH-}" ]]; then
+		color_option='--color-output'
+	else
+		# turn the colors off if called from cgi-bin script
+		color_option='--monochrome-output'
+	fi
+
+	# type check
+	if [[ -z "$expected_JSON" ]]; then
+		entity_type='empty'
+		entity_to_print=''
+	elif checked_JSON="$( jq --compact-output "$color_option" '.' <<< "$expected_JSON" 2> /dev/null )"; then
+		entity_type='JSON'
+		entity_to_print="$checked_JSON"
+	else
+		entity_type='string'
+		entity_to_print="$expected_JSON"
+	fi
+
+	# size check
+	entity_bytes="${#entity_to_print}"
+
+	if (( entity_bytes )); then
+		readarray -tn 0 lines_array <<< "$entity_to_print"
+		entity_lines="${#lines_array[@]}"
+	fi
+
+	if (( entity_lines > 1 )); then
+		echo -en "${LGRAY}${script_basename}:${NOCOLOR} $header ($entity_type, $entity_bytes bytes, $entity_lines lines)"
+	else
+		echo -en "${LGRAY}${script_basename}:${NOCOLOR} $header ($entity_type, $entity_bytes bytes)"
+	fi
+
+	if (( entity_bytes )); then
+		echo ':'
+		if (( entity_lines <= max_lines )); then
+			# print all lines
+			echo "$entity_to_print" # 'echo -e' renders all '\n' words in the server's response to newlines -- unwanted
+		else
+			# print a few first lines + skip message + last $last_lines_count lines
+			# TODO limits checking, like "show me only 3 lines while last_lines_count=2"
+			((
+				first_lines_count = max_lines - 1 - last_lines_count,
+				skipped_lines_count = entity_lines - ( first_lines_count + last_lines_count )
+			))
+			printf '%b\n' "${lines_array[@]: 0:$first_lines_count}"
+			echo -e "${DGRAY}...skipped $skipped_lines_count lines...${NOCOLOR}"
+			printf '%b\n' "${lines_array[@]: -$last_lines_count}"
+		fi
+	else
+		echo
+	fi
+}
+
+function get_ip_as_string {
+	# consts
+	local -r ip_RE='inet addr:([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})'
+
+	# vars
+	local ip_address
+
+	# code
+	if [[ "$ASIC_MODEL" == 'Toddminer C1'* || "$ASIC_MODEL" == 'Avalon'* ]]; then
+		ip_address="$( ifconfig eth0 | grep 'inet ' | awk '{ print $2 }' )"
+	else
+		# legacy method
+		#ip_address="$( LANG=C ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1 }' )"
+		# new method
+		ip_address="$( LANG=C ifconfig eth0 | rematch "$ip_RE" )"
+	fi
+
+	if [[ -n "$ip_address" ]]; then
+		echo "$ip_address"
+	else
+		return 1
+	fi
+}
+
+function get_ip_as_json {
+	# vars
+	local ip_address
+
+	# code
+	if ip_address="$( get_ip_as_string )" && [[ -n "$ip_address" ]]; then
+		echo "[\"${ip_address}\"]"
+	else
+		echo 'null'
+		return 1
+	fi
+}
+
+function grab_exit_code_to_flag { local -r -i incoming_exitcode="$?" # must be the first command in the function to appropriately catch the exit code
+	#
+	# Usage: grab_exit_code_to_flag 'variable_by_ref'
+	#
+
+	# args
+	local -r -n variable_by_ref="$1"
+
+	# code
+	if (( incoming_exitcode == 0 )); then
+		variable_by_ref=1
+	else
+		# shellcheck disable=SC2034
+		# bc by ref
+		variable_by_ref=0
+	fi
+
+	return "$incoming_exitcode" # pass on the exit code (let's be completely exitcode-transparent like in pipes)
+}
+
+function get_hostname_from_url {
+	# args
+	local -r url_as_string="$1"
+
+	# vars
+	local url
+
+	# code
+	IFS='/' read -r _ _ url <<< "$url_as_string"
+	# http://a.b.c/
+	#      ^^     ^
+	echo "$url"
+}
+
+function wait_for_network {
+	#
+	# wait for network interface (until eth0 is up AND ip address not blank AND the server is reachable)
+	#
+
+	# consts
+	local -r default_interface='eth0'
+	local -r -i sleep_counter_accumulator_limit_in_secs=200
+
+	# vars
+	local server_hostname ip_address status_message
+	local -i attempts_counter=1 sleep_counter=0 sleep_time=0
+	local -i sleep_counter_accumulator_local=0 sleep_counter_accumulator_total=0
+
+	# flags
+	local -i is_interface_up_FLAG=0 is_ip_assigned_FLAG=0 is_server_reachable_FLAG=0
+	local -i is_messages_allowed_FLAG
+
+	# code
+	server_hostname="$( get_hostname_from_url "$HIVE_HOST_URL" )"
+
+	while true; do
+		is_interface_up "$default_interface"			;	grab_exit_code_to_flag 'is_interface_up_FLAG'
+		ip_address="$( get_ip_as_string )"				;	grab_exit_code_to_flag 'is_ip_assigned_FLAG'
+		ping -c 1 -w 10 "$server_hostname" &> /dev/null	;	grab_exit_code_to_flag 'is_server_reachable_FLAG' # at least 1 ok packet in 10s
+
+		(( is_interface_up_FLAG ))		&& status_message="$default_interface UP, "		|| status_message="$default_interface DOWN, "
+		(( is_ip_assigned_FLAG ))		&& status_message+="IP $ip_address, "			|| status_message+='IP -.-.-.-, '
+		(( is_server_reachable_FLAG ))	&& status_message+="ping $server_hostname OK"	|| status_message+="ping $server_hostname FAILED"
+
+		(( script_DEBUG )) && { is_server_reachable_FLAG=0; is_interface_up_FLAG=0; }
+
+		if (( ! sleep_counter_accumulator_local || sleep_counter_accumulator_local >= sleep_counter_accumulator_limit_in_secs )); then
+			# ^ the very first time and            ^ once in $sleep_counter_accumulator_limit_in_secs:
+			(( sleep_counter_accumulator_local = 0, sleep_counter = 0 )) # reset counters
+			is_messages_allowed_FLAG=1
+		else
+			is_messages_allowed_FLAG=0
+		fi
+
+		(( is_messages_allowed_FLAG )) && echo_info "Network status: $status_message"
+		(( is_server_reachable_FLAG || ( is_interface_up_FLAG && is_ip_assigned_FLAG ) )) && break
+		(( is_messages_allowed_FLAG )) && echo_error "Attempt #$attempts_counter ($(( sleep_counter_accumulator_total / 60 ))m passed), still waiting for network..."
+
+		((
+			attempts_counter++,
+			sleep_counter++,
+			sleep_time = sleep_counter ** 2,
+			sleep_counter_accumulator_local += sleep_time,
+			sleep_counter_accumulator_total += sleep_time
+		))
+
+		if (( script_DEBUG )); then
+			echo_info "Attempt #$attempts_counter (total time $(( sleep_counter_accumulator_local ))s), will try again in ${sleep_time}s..."
+			sleep 1
+		else
+			sleep $(( sleep_time ))
+		fi
+	done
+}
+
+function get_asic_json {
+	# vars
+	local asic_json
+
+	# code
+	# shellcheck disable=SC2154
+	# bc defined in asic-model
+
+	if [[ -s /usr/bin/compile_time ]]; then # Antminer or Antminer-based machine
+		if (( IS_ASIC_CUSTOM_FW )); then
+			asic_json="$(	file_to_json_array "$ASIC_CUSTOM_FW_description_file"	'{"firmware": .[0], "model": .[1], "logic_version": .[2], "buid": .[4], "puid": .[5]}' )"
+			# TODO should refactor to use constants from asic-model
+		else
+			asic_json="$(	file_to_json_array /usr/bin/compile_time				'{"firmware": .[0], "model": .[1], "logic_version": .[2]}' )"
+		fi
+	fi
+
+	# TODO should move all this to asic-model db
+	case "$ASIC_MODEL" in
+		'Antminer D3 Blissz'*	)
+			asic_json="$(	jq_raw_input_then_slurp /usr/bin/compile_time	'{"firmware": .[0], "model": .[1], "logic_version": "unknown"}'					)";;
+		'b29+.g19'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon A9", "logic_version": .[0]}'			)";;
+		'a9+.g19'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon A9+", "logic_version": .[0]}'			)";;
+		'd9.g19'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon D9", "logic_version": .[0]}'			)";;
+		's11.g19'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon S11", "logic_version": .[0]}'			)";;
+		't3.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T3", "logic_version": .[0]}'			)";;
+		't3+.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T3+", "logic_version": .[0]}'			)";;
+		't2thm.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2Thm", "logic_version": .[0]}'		)";;
+		't2thf.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2Th", "logic_version": .[0]}'		)";;
+		't2th.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2Thf", "logic_version": .[0]}'		)";;
+		't2tz.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2Tz-30T", "logic_version": .[0]}'	)";;
+		't2th+.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2TH+", "logic_version": .[0]}'		)";;
+		't2t.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2T-24T", "logic_version": .[0]}'		)";;
+		't2thf+.soc'			)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2THf+", "logic_version": .[0]}'		)";;
+		't2t+.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2T+(32T)", "logic_version": .[0]}'	)";; #'# syntax highlighting fix
+		't2thl+.soc'			)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2THl+", "logic_version": .[0]}'		)";;
+		't2ts.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2Ts-26T", "logic_version": .[0]}'	)";;
+		't2ti.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T2Ti-25T", "logic_version": .[0]}'	)";;
+		't3h+.soc'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "Innosilicon T3H+", "logic_version": .[0]}'		)";;
+		't1.g19'				)
+			asic_json="$(	jq_raw_input_then_slurp /etc/hwrevision			'{"firmware": .[1], "model": "DragonMint T1", "logic_version": .[0]}'			)";;
+		'Zig Z1+'				)
+			asic_json="$(	jq_raw_input_then_slurp /var/www/html/VERSION	'{"firmware": .[0], "model": "Zig Z1+", "logic_version": "Zig Z1+"}'			)";;
+		'Zig Z1'				)
+			asic_json="$(	jq_raw_input_then_slurp /var/www/html/VERSION	'{"firmware": .[0], "model": "Zig Z1", "logic_version": "Zig Z1"}'				)";;
+		'T4.G19'				)
+			asic_json="$(	jq_raw_input_then_slurp /tmp/type				'{"firmware": .[0], "model": "Innosilicon A5/A8", "logic_version": .[0]}'		)";;
+		'Toddminer C1'			)
+			asic_json="$( /home/sm/miner/build/cpuminer -V | head -n 1 | awk '{ print $3}' |
+							jq_raw_input_then_slurp -						'{"firmware": .[0], "model": "Toddminer C1", "logic_version": .[0]}'			)";;
+		'Toddminer C1 PRO'		)
+			asic_json="$( /home/sm/miner/build/cpuminer -V | head -n 1 | awk '{ print $4}' |
+							jq_raw_input_then_slurp -						'{"firmware": .[0], "model": "Toddminer C1 PRO", "logic_version": .[0]}'		)";;
+		'Avalon'*				)
+			asic_json="$( hostname |
+							 jq_raw_input_then_slurp -						'{"firmware": .[0], "model": "Avalon AV8-0", "logic_version": "Avalon AV8-0"}'	)";;
+	esac
+
+	echo "$asic_json"
+}
+
+function get_uid {
+	# excerpt from GPU hello, for the reference:
+	#uid=$(echo ${system_uuid}-${cpu_id}-${first_mac} | tr '[:upper:]' '[:lower:]' | sha1sum | awk '{print $1}')
+
+	# vars
+	local eth0_mac uid_provisional digest_binary digest_binary_output uid_hash
+
+	# code
+	eth0_mac="$( < /sys/class/net/eth0/address )"
+	uid_provisional="${mb_product}-${eth0_mac}"
+	uid_provisional="${uid_provisional//:}" # trim all ':'
+	uid_provisional="${uid_provisional,,}" # tolower()
+
+	for digest_binary in sha1sum md5sum; do
+		if hash "$digest_binary" 2> /dev/null; then
+			digest_binary_output="$( "$digest_binary" <<< "$uid_provisional" )"
+			read -r uid_hash _ <<< "$digest_binary_output"
+			break
+		fi
+	done
+
+	if [[ -n "$uid_hash" ]]; then
+		echo "$uid_hash"
+	else
+		echo 'ffffffffffffffffffffffffffffffffffffffff' # in case sha1sum/md5sum aren't available
+	fi
+}
+
+function get_hive_client_version {
+	# consts
+	local -r file='/hive/etc/VERSION'
+
+	# vars
+	local version
+
+	# code
+	if [[ -s "$file" ]]; then
+		version="$( < "$file" )"
+	else
+		echo_debug "$file not found or empty"
+		return 1
+	fi
+
+	echo "$version"
+}
+
+function get_hive_client_build_version {
+	# consts
+	local -r file='/hive/etc/build'
+
+	# vars
+	local version
+
+	# code
+	if [[ -s "$file" ]]; then
+		version="$( < "$file" )"
+	else
+		echo_debug "$file not found or empty"
+		return 1
+	fi
+
+	echo "$version"
+}
+
+function get_kernel_version {
+	# global vars
+	local -g hive_client_version
+
+	# vars
+	local kernel_version
+	local hive_client_version hive_client_build_version
+
+	# code
+	kernel_version="$( uname --kernel-release )"
+
+	# add Client's version & build to kernel info
+	hive_client_version="$( get_hive_client_version )"
+	hive_client_build_version="$( get_hive_client_build_version )"
+
+	# add a Client's release/build version
+	if [[ -n "$hive_client_version" && -n "$hive_client_build_version" ]]; then
+		kernel_version+=" ($hive_client_version-$hive_client_build_version)"
+	elif [[ -n "$hive_client_version" && -z "$hive_client_build_version" ]]; then
+		kernel_version+=" ($hive_client_version)"
+	else
+		kernel_version+=' (???)'
+	fi
+
+	# add signed status to a kernel info
+	if [[ "$ASIC_MODEL" == 'Antminer'* ]]; then
+		if ant-functions.sh is_custom_fw_signed; then
+			kernel_version+=' signed'
+		else
+			kernel_version+=' unsigned'
+		fi
+	fi
+
+	if [[ -s '/usr/bin/core' ]]; then
+		kernel_version+=" $( < /usr/bin/core )"
+	fi
+
+	echo "$kernel_version"
+}
+
+function serve_custom_fw_model_cache {
+	# custom fw only: model cache
+
+	# consts
+	local -r antminer_compile_FILE='/usr/bin/compile_time'
+	local -r custom_fw_model_saved_FILE='/hive-config/model'
+	local -r compile_ver_blacklist_RE='(TEST|Antminer X17|[Uu]nknown)'
+
+	# vars
+	local custom_fw_model_detected='' custom_fw_model_saved=''
+	local this_compile_file this_compile_file_2nd_line new_2nd_line
+
+	# code
+	echo_action 'Processing custom fw model cache'
+	# try to get ASIC model from miner's log (Series 17)
+	if [[ -f "$ASIC_CUSTOM_FW_description_file" && -s /var/log/log ]]; then
+		#custom_fw_model_detected="$( grep -Fm1 -e 'Project type:' /var/log/log | awk -F': ' '{print $NF}' )" # old method
+
+		# search for 2 patterns
+		# old one: 2020-10-02 04:48:01 driver/driver-btm-api.c:1450:bitmain_board_init: Project type: Antminer T17+
+		# new one: 2020-09-25 12:54:24 driver/driver-btm-api.c:2257:bitmain_soc_init: Miner compile time: Fri Sep 25 11:25:18 UTC 2020 type: Antminer S17 Hiveon
+		# ^ new one is wrong! should test moar
+		custom_fw_model_detected="$( awk -F ' type: ' '/Project type: |Miner compile time:.+type: /{ print $NF; exit }' < /var/log/log )"
+		[[ -n "$custom_fw_model_detected" ]] && echo_info "Model found in /var/log/log: '$custom_fw_model_detected'"
+	fi
+
+	# remove saved model file if it contains 'TEST'
+	# shellcheck disable=SC2076
+	if [[ -s "$ASIC_CUSTOM_FW_description_file" && "$( < "$ASIC_CUSTOM_FW_description_file" )" =~ 'TEST' ]]; then
+		[[ -f "$custom_fw_model_saved_FILE" ]] && rm "$custom_fw_model_saved_FILE"
+		custom_fw_model_detected=''
+	fi
+
+	# remove saved model file if it contains blacklisted words
+	if [[ -s "$custom_fw_model_saved_FILE" && "$( < "$custom_fw_model_saved_FILE" )" =~ $compile_ver_blacklist_RE ]]; then
+		echo_warning "Model cache contains blacklisted words: '$( < "$custom_fw_model_saved_FILE" )'. Cache cleared"
+		rm "$custom_fw_model_saved_FILE"
+	fi
+
+	if [[ -n "$custom_fw_model_detected" ]]; then
+		if [[ "$custom_fw_model_detected" =~ $compile_ver_blacklist_RE ]]; then
+			# only warn user
+			echo_info "Detected model contains blacklisted words: '$custom_fw_model_detected', skipped"
+			message warning "ASIC model detected: $custom_fw_model_detected" --silent
+			custom_fw_model_detected=''
+		else
+			if [[ -s "$custom_fw_model_saved_FILE" ]]; then
+				# if model is saved -- get a saved model
+				custom_fw_model_saved="$( < "$custom_fw_model_saved_FILE" )"
+				echo_info "Got model from cache: '$custom_fw_model_saved'"
+			else
+				custom_fw_model_saved=''
+				echo_warning "Model cache empty or not found"
+			fi
+			if [[ "$custom_fw_model_saved" != "$custom_fw_model_detected" ]]; then
+				# if detected model is different -- save detected model to file
+				message info "ASIC model re-detected: $custom_fw_model_detected" --silent --payload <<< "'$custom_fw_model_saved' -> '$custom_fw_model_detected'"
+				echo_action "Updating previously detected model '$custom_fw_model_saved' with '$custom_fw_model_detected' in the model cache"
+				echo "$custom_fw_model_detected" > "$custom_fw_model_saved_FILE"
+			fi
+		fi
+	fi
+
+	[[ -s "$custom_fw_model_saved_FILE" ]] && custom_fw_model_detected="$( < "$custom_fw_model_saved_FILE" )"
+
+	if [[ -n "$custom_fw_model_detected" && -s "$ASIC_CUSTOM_FW_description_file" ]]; then
+		for this_compile_file in "$ASIC_CUSTOM_FW_description_file" "$antminer_compile_FILE"; do
+			this_compile_file_2nd_line="$( sed -n '2p' "$this_compile_file" )"
+			if [[ "$this_compile_file_2nd_line" != "$custom_fw_model_detected" ]]; then
+				# add custom fw brand name to compile_* files
+				new_2nd_line="$custom_fw_model_detected $ASIC_CUSTOM_FW_BRAND"
+				echo_action "Processing $this_compile_file: '$this_compile_file_2nd_line' -> '$new_2nd_line'"
+				sed "2s|.*|$new_2nd_line|" -i "$this_compile_file"
+			fi
+		done
+	fi
+}
+
+function send_hello_packet {
+	#
+	# Usage: send_hello_packet 'server_URL' 'server_request_by_ref' 'server_response_by_ref'
+	#
+	# try to send the hello packet (10 times max, every next pause will be longer and longer)
+	#
+
+	# args
+	local -r server_URL="$1"
+	local -r -n server_request_by_ref="$2"
+	local -r -n server_response_by_ref="$3"
+
+	# consts
+	local -r -i curl_initial_connect_timeout=5
+	local -r -i max_connection_attempts=3
+	local -r test_URL="$server_URL/worker/api?a=b"
+	local -r work_URL="$server_URL/worker/api?id_rig=${RIG_ID-}&method=hello"
+
+	# vars
+	local -i attempts_counter curl_connect_timeout curl_max_time curl_exitcode
+	local server_response_sanity_check
+
+	# code
+	print_JSON_with_header "Sending request to $server_URL" "$server_request_by_ref"
+
+	for (( attempts_counter = 1; attempts_counter <= max_connection_attempts; attempts_counter++ )); do
+		(( curl_connect_timeout = curl_initial_connect_timeout + attempts_counter ))
+		(( curl_max_time = curl_connect_timeout * 2 + 1 ))
+		# server sanity check first
+		(( script_DEBUG )) && echo_debug "Proceeding a sanity check for '$test_URL'..."
+		server_response_sanity_check="$(
+			curl \
+				--silent --connect-timeout "$curl_connect_timeout" --max-time "$curl_max_time" \
+				"$test_URL"
+		)"
+		curl_exitcode=$?
+
+		if (( ! curl_exitcode )); then
+			(( script_DEBUG )) && echo_debug 'API server connected [OK]'
+			if [[ -n "$server_response_sanity_check" ]]; then
+				(( script_DEBUG )) && echo_debug 'API server response is not empty [OK]'
+				if jq --exit-status '.error and .error.code' <<< "$server_response_sanity_check" > /dev/null 2>&1; then
+					# ^^^^^^^^^^^^^ jq will exit with exitcode 0 only if output is 'true'
+					(( script_DEBUG )) && echo_debug 'API server is valid [OK]'
+					(( script_DEBUG )) && echo_debug "Connecting to get a config: '$work_URL'..."
+					if (( is_https_allowed_FLAG )); then
+						server_response_by_ref="$(
+							curl \
+								--cacert "$ca_cert_FILE"												\
+								--location --data @- --silent											\
+								--connect-timeout "$curl_connect_timeout" --max-time "$curl_max_time"	\
+								--request POST "$work_URL"												\
+								--header 'Content-Type: application/json'								\
+							<<< "$server_request_by_ref"
+						)"
+					else
+						server_response_by_ref="$(
+							curl \
+								--insecure \
+								--location --data @- --silent											\
+								--connect-timeout "$curl_connect_timeout" --max-time "$curl_max_time"	\
+								--request POST "$work_URL"												\
+								--header 'Content-Type: application/json'								\
+							<<< "$server_request_by_ref"
+						)"
+					fi
+					curl_exitcode=$?
+					(( ! curl_exitcode )) && break
+				else
+					echo
+					print_JSON_with_header 'Sanity checker received an invalid response' "$server_response_sanity_check"
+					echo_error "Server is not a valid API server. No second chances provided for this type of error."
+					curl_exitcode=1
+					break
+				fi
+			else
+				echo_error "Empty answer from $server_URL. No second chances provided for this type of error."
+				curl_exitcode=1
+				break
+			fi
+		fi
+
+		echo_error "$( human-curl-error $(( curl_exitcode )) )"
+		[[ -n "$server_response_by_ref" ]] && print_JSON_with_header 'Server response' "$server_response_by_ref"
+		echo_error "Connection attempt #$attempts_counter failed, will try again in ${attempts_counter}s..."
+		sleep $(( attempts_counter ))
+	done
+
+	# show the server response
+	echo
+	print_JSON_with_header 'Received response' "$server_response_by_ref"
+	echo
+
+	return $(( curl_exitcode ))
+}
+
+function get_system_boot_time_in_seconds {
+	#
+	# Usage: get_system_boot_time_in_seconds
+	#
+	awk '/btime/{print $2}' /proc/stat
+}
+
+function flip_boolean_flag { # !!! NOT USED ATM
+	#
+	# Usage: flip_boolean_flag 'boolean_flag_to_flip_by_ref'
+	#
+
+	# args
+	local -r -n boolean_flag_to_flip_by_ref="$1"
+
+	# code
+	case "$boolean_flag_to_flip_by_ref" in
+		'0'|'1')
+			(( 1 - boolean_flag_to_flip_by_ref ))
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+function are_variable_and_file_identical {
+	#
+	# Usage: are_variable_and_file_identical 'variable_to_compare_by_ref' 'filename_to_compare'
+	#
+
+	# args
+	local -r -n variable_to_compare_by_ref="$1"
+	local -r filename_to_compare="$2"
+
+	# flags
+	local -i is_file_empty_FLAG is_variable_empty_FLAG
+
+	# code
+	[[ -f "$filename_to_compare"		]] || return 1 # file not found, compare failed
+	[[ -s "$filename_to_compare"		]]; is_file_empty_FLAG=$? # translate bash exit code to C-boolean
+	[[ -n "$variable_to_compare_by_ref" ]]; is_variable_empty_FLAG=$? # translate bash exit code to C-boolean
+
+	if (( is_file_empty_FLAG && is_variable_empty_FLAG )); then
+		# both are empty, therefore -- identical!
+		return 0
+	elif (( ! is_file_empty_FLAG && ! is_variable_empty_FLAG )); then
+		# both aren't empty, let's diff 'em
+		diff <( echo "$variable_to_compare_by_ref" ) "$filename_to_compare" > /dev/null 2>&1
+	else
+		# one is empty and another is not -- not identical indeed
+		return 1
+	fi
+}
+
+function save_variable_to_file {
+	#
+	# Usage: save_variable_to_file 'variable_to_save_by_ref' 'filename_to_save'
+	#
+
+	# args
+	local -r -n variable_to_save_by_ref="$1"
+	local -r filename_to_save="$2"
+
+	# consts
+	local -r new_suffix='new' previous_suffix='previous'
+
+	# flags
+	local -i is_variable_saved_FLAG=0
+
+	# code
+	until (( is_variable_saved_FLAG )); do
+		# NOTE: neat trick -- chained multiple checks without multiple IFs
+		# pretty normal exceptions but in the bash
+
+		if [[ -s "$filename_to_save" ]]; then
+			# file is exist and not empty, so there are some runarounds:
+			# 1. write a config to the new file (test the media writeability)
+			echo "$variable_to_save_by_ref" > "${filename_to_save}.${new_suffix}"	|| break
+
+			# 2. file has been written ok, proceed to the filenames' swap
+			# 2.1. current to previous
+			mv "$filename_to_save" "${filename_to_save}.${previous_suffix}"			|| break
+			# 2.2. new to current
+			mv "${filename_to_save}.${new_suffix}" "$filename_to_save"				|| break
+		else
+			# file isn't exist or empty, do write directly
+			echo "$variable_to_save_by_ref" > "$filename_to_save"					|| break
+		fi
+
+		# set ok flag then leave the loop
+		is_variable_saved_FLAG=1
+		break
+	done
+
+	(( is_variable_saved_FLAG )) # translate a C-boolean to bash exit code
+}
+
+function process_json_sections {
+	#
+	# Usage: process_json_sections 'server_response_json_by_ref'
+	#
+
+	# TODO save (DONE!) and apply asic/asic_oc config
+	#
+	# issue: duplicate code
+	#
+	# solution: we could decouple command-processing module from the agent and make it a separate entity
+	# that can execute requests from agent aaaand.. hello!
+
+	# args
+	local -r -n server_response_json_by_ref="$1"
+
+	# dicts
+	local -A sections_DICT=(
+		['sections_list']='config wallet asic_oc asic'
+
+		['config.description']='Worker configuration'
+		['config.json_key']='.result.config'
+		['config.file']="$RIG_CONF"
+		['config.reload_after_save']=1
+		['config.is_mandatory']=1
+
+		['wallet.description']='Wallet'
+		['wallet.json_key']='.result.wallet'
+		['wallet.file']="$WALLET_CONF"
+		['wallet.reload_after_save']=0
+		['wallet.is_mandatory']=0
+
+		['asic_oc.description']='OC profile'
+		['asic_oc.json_key']='.result.asic_oc'
+		['asic_oc.file']="$ASIC_OC_CONF"
+		['asic_oc.reload_after_save']=0
+		['asic_oc.is_mandatory']=0
+
+		['asic.description']='Firmware configuration'
+		['asic.json_key']='.result.asic'
+		['asic.file']="$ASIC_CONF"
+		['asic.reload_after_save']=0
+		['asic.is_mandatory']=0
+	)
+
+	# vars
+	local -a sections_list_ARR
+	local this_section
+	local this_section_description	this_section_json_key			this_section_json_value
+	local this_section_file			this_section_reload_after_save	this_section_is_mandatory
+
+	# code
+	IFS=' ' read -r -a sections_list_ARR <<< "${sections_DICT['sections_list']}"
+	# for each section...
+	for this_section in "${sections_list_ARR[@]}"; do
+		this_section_description="${sections_DICT[${this_section}.description]}"
+		this_section_json_key="${sections_DICT[${this_section}.json_key]}"
+		this_section_file="${sections_DICT[${this_section}.file]}"
+		this_section_reload_after_save="${sections_DICT[${this_section}.reload_after_save]}"
+		this_section_is_mandatory="${sections_DICT[${this_section}.is_mandatory]}"
+
+		this_section_json_value="$( jq --raw-output "$this_section_json_key" <<< "$server_response_json_by_ref" )" ||
+			die "Error while parsing '$this_section_description' from the server response, exiting..." 1
+
+		if is_JSON_string_not_empty_or_null "$this_section_json_value"; then
+			if are_variable_and_file_identical 'this_section_json_value' "$this_section_file"; then
+				echo_info "Nothing new in '$this_section_description', saving to file skipped"
+			else
+				if save_variable_to_file 'this_section_json_value' "$this_section_file"; then
+					echo_ok "'$this_section_description' updated and saved to $this_section_file"
+					if (( this_section_reload_after_save )); then
+						# shellcheck disable=SC1090
+						# just because
+						source "$this_section_file" && echo_ok "'$this_section_description' reloaded"
+					fi
+				else
+					echo_error "'$this_section_description' NOT saved (write error)"
+				fi
+			fi
+		else
+			if (( this_section_is_mandatory )); then
+				die "No '$this_section_description' found in the server response. That does not have any sense. Exiting..." 1
+			else
+				echo_warning "'$this_section_description' is empty or not found, saving to file skipped"
+			fi
+		fi
+	done
+}
+
+
+
+# global consts
+
+# paths
+declare -r client_run_DIR='/run/hive'
+declare -r RIG_CONF_default='/hive-config/rig.conf'
+declare -r RIG_CONF="${RIG_CONF:-$RIG_CONF_default}" # for ASIC emulator: set to default only if RIG_CONF variable is empty
+declare -r WALLET_CONF='/hive-config/wallet.conf'
+declare -r ASIC_CONF='/hive-config/hiveon.conf'
+declare -r ASIC_OC_CONF='/hive-config/asic_oc.conf'
+declare -r HELLO_OK_file='/tmp/.hive-hello-ok'
+declare -r API_HOST_FILE="$client_run_DIR/api_host_url" # an accessory file for the /hive/bin/message and /hive/bin/hello
+# https support section
+declare -r ca_cert_FILE='/etc/ssl/certs/ca-certificates.crt'
+declare -r https_semaphore_flag_FILE="$client_run_DIR/https-supported.flag"
+# misc
+declare -r FARM_HASH_valid_RE='^[[:xdigit:]]{40}$'
+declare -r -i platform=2 # 1=GPU Rig, 2=ASIC, 3=ASIC Hub
+
+
+# global flags
+
+declare -i arg_boot_FLAG=0				# send boot flag with hello message
+declare -i arg_restartminer_FLAG=0		# will need to restart miner after
+declare -i is_https_allowed_FLAG=0		# to choose between curl options
+
+
+# global vars
+
+declare arg_worker_name=''
+declare mb_manufacturer mb_product
+declare server_request_json server_response_json
+
+
+# global exports
+
+[[ ! "$PATH" =~ (^|:)/hive/bin:/hive/sbin(:|$) ]] && export PATH="$PATH:/hive/bin:/hive/sbin" # add only if not exist
+[[ ! "$LD_LIBRARY_PATH" =~ (^|:)/hive/lib(:|$) ]] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:}/hive/lib" # save $LD_LIBRARY_PATH:/hive/share/S9/lib for hiveon
+
+
+# global sources
+
+# shellcheck disable=SC1091
+# just because
+[[ -f "$RIG_CONF" ]] && ! grep -Eq '^FARM_HASH=.+$' "$RIG_CONF" && source /hive/bin/colors # duct tape: turn the colors off for cgi-bin script
+# !!! do we still need this tape?
+
+
+# main
+
+print_script_version
+
+[[ -f "$HELLO_OK_file" ]] && rm "$HELLO_OK_file"
+
+mkdir -p /hive-config
+
+# asserts
+
+[[ -s "$RIG_CONF" ]]												|| die "Configuration file $RIG_CONF is empty or not found, exiting..." 1
+
+# shellcheck disable=SC1090
+# just because
+source "$RIG_CONF"
+
+# shellcheck disable=SC1090
+# just because
+#[[ -s "$API_HOST_FILE" ]] && source "$API_HOST_FILE" # load the most relevant HIVE_HOST_URL variable
+[[ -s "$API_HOST_FILE" ]] && rm "$API_HOST_FILE" # delete for change api
+
+[[ -n "${FARM_HASH-}" || -n "${RIG_ID-}" ]]							|| die "FARM_HASH or RIG_ID is not defined in $RIG_CONF, exiting..." 1
+[[ ( -n "${RIG_ID-}" && -n "${RIG_PASSWD-}" ) || -z "${RIG_ID-}" ]]	|| die "RIG_PASSWD is not defined in $RIG_CONF, exiting..." 1
+[[ -n "${HIVE_HOST_URL-}" ]]										|| die "HIVE_HOST_URL is not defined in $RIG_CONF, exiting..." 1
+
+# shellcheck disable=SC1091
+# just because
+source /hive/bin/asic-model
+[[ "$ASIC_MODEL" == 'Toddminer C1'* && ! "$PATH" =~ (^|:)/sbin ]] && export PATH="$PATH:/sbin:/usr/sbin" # add if not exist
+
+
+parse_arguments "$@"
+
+
+wait_for_network
+
+
+# collect system information
+
+mb_manufacturer="$ASIC_MANUFACTURER"
+if [[ "$ASIC_MANUFACTURER" == 'Bitmain' && -s /usr/bin/manufacturer ]]; then
+	mb_manufacturer="$( < /usr/bin/manufacturer )"
+else
+	mb_manufacturer="$ASIC_MANUFACTURER"
+fi
+
+mb_product="$ASIC_MODEL"
+
+ip_json="$( get_ip_as_json )"
+net_interfaces_json="$( ip -o link | awk '!/LOOPBACK|POINTOPOINT|NOARP/{ printf "{\"iface\": \"%s\", \"mac\": \"%s\"}\n", substr($2, 1, length($2)-1), $(NF-2) }' | jq --slurp --compact-output '.' )"
+
+cpu_model="$( grep -m1 '^model name' /proc/cpuinfo | sed 's/model name[ :\t]*//g' )"
+#cpu_hardware=`cat /proc/cpuinfo | grep -m1 "^Hardware" | sed 's/Hardware[ :\t]*//g'
+#[[ -n "$cpu_hardware" ]] && cpu_model="$cpu_model ($cpu_hardware)"
+cpu_cores="$( grep -c '^model name' /proc/cpuinfo )"
+aes="$( grep -c '^Features.*aes' /proc/cpuinfo )"
+kernel="$( get_kernel_version )"
+hive_client_version="$( get_hive_client_version )"
+
+(( IS_ASIC_CUSTOM_FW )) && serve_custom_fw_model_cache
+
+asic_json="$( get_asic_json )"
+uid="$( get_uid )"
+boot_POSIX_time="$( get_system_boot_time_in_seconds )"
+
+
+# construct a request
+
+# shellcheck disable=SC2016
+server_request_json="$(
+	jq --null-input --compact-output									\
+		--argjson	platform			"${platform:-null}"				\
+		--arg		rig_id				"${RIG_ID:-}"					\
+		--arg		passwd				"${RIG_PASSWD:-}"				\
+		--arg		uid					"${uid:-}"						\
+		--argjson	boot_time			"${boot_POSIX_time:-null}"		\
+		--argjson	boot_event			"${arg_boot_FLAG:-null}"		\
+		--argjson	ip					"${ip_json:-null}"				\
+		--argjson	net_interfaces		"${net_interfaces_json:-null}"	\
+		--arg		manufacturer		"${mb_manufacturer:-}"			\
+		--arg		product				"${mb_product:-}"				\
+		--arg		model				"${cpu_model:-}"				\
+		--argjson	cores				"${cpu_cores:-null}"			\
+		--argjson	aes					"${aes:-null}"					\
+		--argjson	asic				"${asic_json:-null}"			\
+		--argjson	asic_chain_count	"${ASIC_CHAIN_COUNT:-null}"		\
+		--argjson	fans_count			"${ASIC_FAN_COUNT:-null}"		\
+		--arg		kernel				"${kernel:-}"					\
+		--arg		version				"${hive_client_version:-}"		\
+		'{
+			"method": "hello", "jsonrpc": "2.0", "id": 0,
+			"params": {
+				$platform,
+				$rig_id, $passwd, $uid,
+				$boot_time, $boot_event,
+				$ip, $net_interfaces,
+				"mb": {$manufacturer, $product},
+				"cpu": {$model, $cores, $aes},
+				$asic, $asic_chain_count, $fans_count,
+				$kernel, $version
+			}
+		}'
+)"
+
+
+# try to get a worker name from /config/HIVE_WORKER_NAME
+if [[ -s /config/HIVE_WORKER_NAME ]]; then
+	arg_worker_name="$( < /config/HIVE_WORKER_NAME )"
+	echo_info "File /config/HIVE_WORKER_NAME found, using its content as a new worker name: $arg_worker_name"
+	rm /config/HIVE_WORKER_NAME
 fi
 
 
-request=$(
-jq -n \
---arg uid "$uid" \
---arg rig_id "$RIG_ID" \
---arg passwd "$RIG_PASSWD" \
---arg farm_hash "$FARM_HASH" \
---arg boot_time "$boot_time" \
---arg boot_event "$arg_boot" \
---argjson ip "$ips_json" \
---argjson net_interfaces "$net_interfaces" \
---arg model "$cpu_model" --arg cores "$cpu_cores" --arg aes "$aes" \
---arg manufacturer "$mb_manufacturer" --arg product "$mb_product" \
---argjson asic "$asic" \
---arg asic_chain_count "$asic_chain_count" \
---arg kernel "$kernel" \
---arg version "$hive_version" \
-'{
-	"method": "hello", "jsonrpc": "2.0", "id": 0,
-	"params": {
-		$rig_id, $passwd, $farm_hash, $uid,
-		$boot_time, $boot_event, $ip, $net_interfaces,
-		"mb": {$manufacturer, $product},
-		"cpu": {$model, $cores, $aes},
-		$asic, $asic_chain_count,
-		$kernel, $version
-	}
-}'
+# add a user-defined worker name (either from file or from script arguments) to server_request_json
+if [[ -n "$arg_worker_name" ]]; then
+	echo_info "Using '$arg_worker_name' as WORKER_NAME"
+	# shellcheck disable=SC2016
+	server_request_json="$( jq --arg worker_name "$arg_worker_name" --compact-output '. * {"params": {$worker_name}}' <<< "$server_request_json" )"
+fi
+
+
+# add FARM_HASH to server_request_json
+if [[ -n "${FARM_HASH-}" ]]; then
+	if [[ "$FARM_HASH" =~ $FARM_HASH_valid_RE ]]; then
+		echo_info "Using FARM_HASH '$FARM_HASH' (${#FARM_HASH} bytes)"
+		# shellcheck disable=SC2016
+		server_request_json="$( jq --arg farm_hash "$FARM_HASH" --compact-output '. * {"params": {$farm_hash}}' <<< "$server_request_json" )"
+	else
+		echo_error "Invalid FARM_HASH '$FARM_HASH' (${#FARM_HASH} bytes), will not be used"
+	fi
+fi
+
+
+# shellcheck disable=SC1090
+# just because
+[[ -s "$API_HOST_FILE" ]] && source "$API_HOST_FILE" # load the most relevant HIVE_HOST_URL variable
+
+# temp fix
+declare this_api_server
+declare -i is_hello_sent_ok_FLAG=0
+declare -a API_HOST_URLs_bootstrap_collection=(
+	# ??? should move it to /hive/etc/environment
+	'http://helsinki.hiveos.farm'
+	'http://msk.hiveos.farm'
+	'http://paris.hiveos.farm'
+	'http://amster.hiveos.farm'
+	'http://ca1.hiveos.farm'
+	'http://api-ru-cf.hiveos.farm'
+	'http://ap.hiveos.farm'
+	'http://naw.hiveos.farm'
+	'http://api2msk.hiveos.farm'
+	'http://api.hiveos.farm'
 )
 
-if [[ ! -z $arg_hostname ]]; then
-	request=`echo "$request" | jq --arg worker_name "$arg_hostname" '. * {"params": {$worker_name}}'`
+# check https, set flag
+is_https_allowed; grab_exit_code_to_flag 'is_https_allowed_FLAG'
+
+
+# send the hello packet (mind the VarByRef function's parameters)
+for this_api_server in "$HIVE_HOST_URL" "${API_HOST_URLs_bootstrap_collection[@]}"; do
+	if send_hello_packet "$this_api_server" 'server_request_json' 'server_response_json'; then
+		echo "HIVE_HOST_URL=\"${this_api_server}\"" > "$API_HOST_FILE"
+		is_hello_sent_ok_FLAG=1
+		break
+	fi
+done
+
+# assert
+(( is_hello_sent_ok_FLAG )) || die "Error connecting to $HIVE_HOST_URL and $this_api_server. No servers left, exiting..." #404 is not a bad exit code
+
+
+# and then check received JSON
+if server_error="$( jq --raw-output '.error' <<< "$server_response_json" 2> /dev/null )"; then
+	if is_JSON_string_not_empty_or_null "$server_error"; then
+		die "Server responded with error '$( jq --raw-output '.error.message' <<< "$server_response_json" )'" 1
+	fi
+else
+	die 'Error while parsing server response as JSON, exiting...' 1
 fi
 
-echo "$request" | jq -c '.'
 
-response=$(echo $request | curl --insecure -L --data @- --connect-timeout 15 --max-time 25 --silent -XPOST "${HIVE_URL}?id_rig=$RIG_ID&method=hello" -H "Content-Type: application/json")
-exitcode=$?
-[[ $exitcode -ne 0 ]] &&
-	echo -e "${RED}Error connecting to Hive server${NOCOLOR} $HIVE_HOST_URL" &&
-	human-curl-error $exitcode &&
-	exit $exitcode #404 is not a bad exit code
-
-#output and check json
-echo "$response" | jq '.'
-
-[ $? -ne 0 ] && echo -e "${RED}Error parsing JSON response:${NOCOLOR} $response" && exit $? #error json parsing
-
-error=$(echo $response | jq '.error' --raw-output)
-[[ ! -z "$error" && "$error" != "null" ]] && echo -e "${RED}ERROR:${NOCOLOR} `echo $response | jq '.error.message' -r`" && exit 1
+# proceed with configuration sections and save it to corresponding files, if needed
+process_json_sections 'server_response_json'
 
 
-
-
-
-# Save config and check it ================================================================
-config=$(echo $response | jq '.result.config' --raw-output)
-[[ -z "$config" || "$config" == "null" ]] &&
-	echo "Response body: $response" &&
-	echo -e "${RED}ERROR:${NOCOLOR} no config field in response" &&
-	exit 1
-echo "$config" > $RIG_CONF
-. $RIG_CONF
-#hostname-check
-
-[[ ! -z $TIMEZONE ]] && export TZ=$TIMEZONE
-
-
-# Timezone ================================================================
-#[[ ! -z $TIMEZONE ]] &&
-#	timedatectl set-timezone "$TIMEZONE"
-
-
-# Wallet config ================================================================
-wallet=$(echo $response | jq '.result.wallet' --raw-output)
-if [[ ! -z "$wallet" && "$wallet" != "null" ]]; then
-	echo "$wallet" > $WALLET_CONF
+# set timezone
+if [[ -n "${TIMEZONE-}" ]]; then
+	if hash 'timedatectl' 2> /dev/null; then
+		timedatectl set-timezone "$TIMEZONE"
+	else
+		export TZ="$TIMEZONE"
+	fi
 fi
 
 
 # Post actions =================================================================
-#restartminer - restart miner on success
-if [[ $arg_restartminer == 1 ]]; then
+# restartminer - restart miner on success
+if (( arg_restartminer_FLAG )); then
+	echo_action 'Restarting miner'
 	/hive/bin/miner restart
-#	[[ $WD_ENABLED == 1 ]] &&
-#		wd restart
 fi
 
-echo "Touching $HELLO_OK"
-touch $HELLO_OK
+echo_ok 'Finished'
+touch "$HELLO_OK_file"
 
-
-#Flush buffers if any files changed
+# flush buffers if any files changed
 sync
 
 exit 0

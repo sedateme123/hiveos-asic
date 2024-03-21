@@ -1,0 +1,101 @@
+#!/hive/sbin/bash
+
+
+#
+# Copyright (C) 2016-2020  Hiveon
+# Distributed under GNU GENERAL PUBLIC LICENSE 2.0
+# License information can be found in the LICENSE file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+
+
+readonly script_mission='Client for ASICs: ssh access control'
+readonly script_version='0.2.4'
+readonly script_basename="${0##*/}"
+
+
+# !!! bash strict mode, no unbound variables
+set -o nounset
+
+
+# functions
+
+function print_script_version {
+	echo -e "${YELLOW-}${script_mission}, version ${script_version}${NOCOLOR-}"
+	echo
+}
+
+function print_script_usage {
+	echo -e "Usage: ${CYAN-}${script_basename} status | on | off${NOCOLOR-}"
+	echo
+}
+
+# shellcheck disable=SC2120
+function is_ssh_server_listen {
+	#
+	# Usage: is_ssh_server_listen
+	#
+
+	# consts
+
+	local -r -i ssh_port_DEFAULT=22
+
+	# args
+
+	local port="${1-${ssh_port_DEFAULT}}"
+
+	# vars
+
+	local -i ssh_listen_sockets_number
+
+	# code
+
+	ssh_listen_sockets_number="$( netstat -lnt 2> /dev/null | grep -cFe ":$port" -- )"
+	(( ssh_listen_sockets_number ))
+}
+
+
+# global args
+
+readonly command="${1-}"
+readonly option="${2-}"
+
+
+# global sources
+
+source colors
+
+
+# main()
+
+print_script_version
+
+case "$command" in
+	'on')
+		rm /config/dropbear
+		rm /etc/default/dropbear
+		/etc/init.d/dropbear start
+		echo -e "ssh turned ${BRED-}ON${NOCOLOR-} till the next reboot"
+		;;
+	'off')
+		rm /config/dropbear
+		killall dropbear
+		echo -e "ssh turned ${BGREEN-}OFF${NOCOLOR-} permanently"
+		;;
+#	'--permanent')
+#		ln -s /dev/null /config/dropbear -sf; nohup /etc/init.d/dropbear start & # are you sure?
+#		echo -e 'ssh turned ON permanently'
+#		;;
+	'status')
+		# shellcheck disable=SC2119
+		if is_ssh_server_listen; then
+			echo -e "Port 22 opened, ssh is ${BRED-}ON${NOCOLOR-}"
+			exit 22
+		else
+			echo -e "Port 22 closed, ssh is ${BGREEN-}OFF${NOCOLOR-}"
+			exit 0
+		fi
+		;;
+	*)
+		print_script_usage
+		;;
+esac

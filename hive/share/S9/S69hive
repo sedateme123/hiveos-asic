@@ -1,45 +1,129 @@
 #!/bin/sh
 
-if [ ! -e /hive ]; then
-    cd /tmp
-    URL="hiveos.farm"
-    if [ -e /config/HIVE_HOST_URL ]; then
-        URL=$(cat /config/HIVE_HOST_URL | sed s%'http://api.'%%)
-    fi
-    curl -L --insecure http://download.$URL/asic/repo/s9/latest -o latest.tar.gz
-    echo "> Extracting latest.tar.gz"
-    if [ ! -d /config/hive ]; then
-        mkdir -p /config/hive/hive-config
-    fi
-    tar -xzv -f latest.tar.gz
-    [ -L /hive ] && rm /hive
-    rm -rf hiveos-asic-*/hive/sbin/teleconsole
-    cp -rf hiveos-asic-*/hive /
-    [ $? -ne 0 ] && echo "Error extracting latest.tar.gz" && exit 1
 
-    rm latest.tar.gz
-    rm -rf hiveos-asic*
+#
+# Copyright (C) 2017  Hiveon Holding LTD
+# Distributed under Business Source License 1.1
+# License information can be found in the LICENSE.txt file or at https://github.com/minershive/hiveos-asic/blob/master/LICENSE.txt
+#
+# Linted by shellcheck 0.7.0
+# shellcheck shell=dash
+#
 
-    sleep 2
 
-    export PATH=$PATH:/hive/bin:/hive/sbin
-    export LD_LIBRARY_PATH=/hive/lib
-    [[ -d /hive-config && ! -L /hive-config ]] && mv -f /hive-config /config/hive/
-    ln -s /config/hive/hive-config/ /hive-config
-    #cp -rf /hive/share/S9/S69hive /etc/rcS.d/
-    cp -rf /hive/share/S9/.profile /home/root/
+readonly script_mission='Client for ASICs: Boot & Deploy for S9'
+readonly script_version='0.0.1'
+readonly script_basename="${0##*/}"
+readonly script_DEBUG="${script_DEBUG:-1}" # use value from env if exists
 
-    #/hive/bin/hive
 
-    #sleep 2
+# functions
 
-    #$FARM_HASH can be defined externally
-    if [ -e /config/FARM_HASH ]; then
-        FARM_HASH=$(cat /config/FARM_HASH)
-        bash -c "/hive/bin/firstrun $FARM_HASH"
-        rm /config/FARM_HASH
-    fi
+is_tmp_available () {
+	[ -d /tmp ] && [ -w /tmp ]
+}
+
+
+# global consts
+
+readonly own_log_FILE='/tmp/.S69hive.log' # the dot is to hide a log from a logicige (see a little down south)
+readonly is_client_installed_marker_FILE='/hive/share/zzz/EOF'
+readonly client_download_default_URL='http://download.hiveos.farm'
+readonly client_download_failback_URL='http://download2.hiveos.farm'
+
+
+# global flags
+
+is_client_package_downloaded_FLAG=0
+
+
+# code
+trap 'echo "SIGHUP received, ignoring..."' HUP
+
+# wait for the system to stabilize
+until is_tmp_available; do
+	echo_info 'Waiting 2s for /tmp to become writeable...'
+	sleep 2
+done
+
+exec >> "$own_log_FILE" 2>&1
+
+rm -rf /tmp/*.log # maintain a little logicide
+
+if [ ! -d /config/hive/hive-config ]; then
+	mkdir -p /config/hive/hive-config
 fi
 
+#if [ ! -e /hive ]; then # deprecated in a favor of a marker file
+if [ -s "$is_client_installed_marker_FILE" ]; then
+	# the client is in place, proceed further
+	export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:}/hive/lib"
+else
+	# the client isn't installed, let's download it
+	cd /tmp
 
-/hive/bin/hive > /tmp/hive-boot.log
+	# process special files
+	if [ -s /etc/hive-downloads-url ]; then
+		client_download_special_URL="$( cat /etc/hive-downloads-url )"
+	elif [ -s /config/HIVE_HOST_URL ]; then
+		client_download_special_URL="$( sed 's|//api\.|//download.|' < /config/HIVE_HOST_URL )"
+	fi
+
+	while [ "$is_client_package_downloaded_FLAG" -eq 0 ]; do
+		# note the absense of "" quotes -- so we'll be able to use multi-line special files
+		#                  vvvvvvvvvvvvvvvvvvvvvvvvvvvv vvvvvvvvvvvvvvvvvvvvvvvvvvvv vvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+		for this_domain in $client_download_special_URL $client_download_default_URL $client_download_failback_URL; do
+			# try to download from this_domain
+			echo "> Downloading latest.tar.gz from $this_domain..."
+			client_package_URL="${this_domain}/asic/client/latest.tar.gz"
+			if curl --retry 3 --location --insecure "$client_package_URL" --output latest.tar.gz; then
+				# check a downloaded package for crc
+				if gunzip -tvf latest.tar.gz > /dev/null 2>&1; then
+					is_client_package_downloaded_FLAG=1
+					break
+				fi
+			else
+				echo "Error downloading latest.tar.gz from $this_domain"
+			fi
+			sleep 1 # to prevent a packet storm
+		done
+	done
+
+#	if [ ! -d /config/hive/hive-config ]; then
+#		mkdir -p /config/hive/hive-config
+#	fi
+	echo '> Extracting latest.tar.gz...'
+	tar -xzv -f latest.tar.gz || { echo 'Error extracting'; exit 1; }
+	[ -L /hive ] && rm /hive
+	rm -rf hiveos-asic-*/hive/sbin/teleconsole
+	echo '> Copying hive to /...'
+	cp -rf hiveos-asic-*/hive / || { echo 'Error copying'; exit 1; }
+
+	rm latest.tar.gz
+	rm -rf hiveos-asic*
+
+	sleep 2
+
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
+	export LD_LIBRARY_PATH=/hive/lib
+	[ -d /hive-config ] && [ ! -L /hive-config ] && mv -f /hive-config /config/hive/
+	ln -s /config/hive/hive-config/ /hive-config
+	#cp -rf /hive/share/S9/S69hive /etc/rcS.d/
+	cp -rf /hive/share/S9/.profile /home/root/
+
+	#/hive/bin/hive
+
+	#sleep 2
+
+	#$FARM_HASH can be defined externally
+	if [ -s /config/FARM_HASH ]; then
+		FARM_HASH="$( cat /config/FARM_HASH )"
+		/hive/bin/firstrun "$FARM_HASH"
+		rm /config/FARM_HASH
+	fi
+fi
+
+( /hive/bin/hive < /dev/null > /tmp/client-boot.log 2>&1 & ) # double fork: init (PID 1) should inherit this process

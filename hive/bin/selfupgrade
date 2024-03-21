@@ -6,23 +6,18 @@
 [ -e "/var/www/html/src/Template/Layout/signin.twig" ] && ASIC_MODEL=`cat /var/www/html/src/Template/Layout/signin.twig | grep title | sed 's/<[^>]*>//g' | sed s/\ *//` #Zig old firmware
 [ -e "/var/www/html/src/Template/Layout/signin.twig" ] && [ -e "/var/www/html/TYPE" ] && ASIC_MODEL=$(echo $ASIC_MODEL | sed s/"{{ type() }}"/$(cat /var/www/html/TYPE)/) #Zig new firmware
 [ -e "/tmp/type" ] && [ ! -e "/etc/hwrevision" ] && ASIC_MODEL=`cat /tmp/type`.`cat /tmp/hwver` #Innosilicon A5/8
-[ -e "/tmp/miner-info" ] && ASIC_MODEL=`cat /tmp/miner-info` #WhatsMiner
 echo $ASIC_MODEL
 
-if [ "$ASIC_MODEL" == "Zig Z1+" ] || [ "$ASIC_MODEL" == "Zig Z1" ] || echo "$ASIC_MODEL" | grep -q -s -F "WhatsMiner"; then
+if [ "$ASIC_MODEL" == "Zig Z1+" ] || [ "$ASIC_MODEL" == "Zig Z1" ]; then
 	release=`wget -q -O- https://raw.githubusercontent.com/minershive/hiveos-asic/master/hive/etc/VERSION`
 else
 	release=`curl -f --silent -L --insecure https://raw.githubusercontent.com/minershive/hiveos-asic/master/hive/etc/VERSION`
 fi
 
-#DEL!!!
-release=whatsminer
-
 exitcode=$?
 version=0
 [ -e /hive/etc/VERSION ] && version=`cat /hive/etc/VERSION`
-#filename=v$release.tar.gz #RESTORE!!!
-filename=$release.tar.gz
+filename=v$release.tar.gz
 
 t=`df -h | grep  '/tmp' | awk '{print $NF}'`
 [ -z $t ] && t='/tmp'
@@ -62,8 +57,8 @@ url=http://github.com/minershive/hiveos-asic/archive/$filename
 echo $url
 
 echo "> Downloading $url"
-if [ "$ASIC_MODEL" == "Zig Z1+" ] || [ "$ASIC_MODEL" == "Zig Z1" ] || echo "$ASIC_MODEL" | grep -q -s -F "WhatsMiner"; then
-	wget $url -O $filename
+if [ "$ASIC_MODEL" == "Zig Z1+" ] || [ "$ASIC_MODEL" == "Zig Z1" ]; then
+	wget $url
 else
 	curl -L --insecure -O $url
 fi
@@ -81,19 +76,19 @@ install_antminer_bmminer() { # bmminer, / - rw, cron
 	fi
 	tar -xzv -f $filename
 	[ -L /hive ] && rm /hive
-	rm -rf hiveos-asic-$release/hive/sbin/teleconsole
-	cp -rf hiveos-asic-$release/hive /
-	[ $? -ne 0 ] && echo "Error extracting $filename" && exit 1
 
-	rm $filename
+	echo_action 'Copying to /'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive" / || die 'Copy error'
 
 	sleep 2
 
-	export PATH=$PATH:/hive/bin:/hive/sbin
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
 	export LD_LIBRARY_PATH=/hive/lib
-	#[[ -d /hive && ! -L /hive ]] && mv -f /hive /config/hive/
-	[[ -d /hive-config && ! -L /hive-config ]] && mv -f /hive-config /config/hive/
-
+	#[ -d /hive && ! -L /hive ] && mv -f /hive /config/hive/
+	[ -d /hive-config ] && [ ! -L /hive-config ] && mv -f /hive-config /config/hive/
 
 	if [ ! -e /hive-config ]; then
 		#ln -s /config/hive/hive/ /hive
@@ -102,62 +97,72 @@ install_antminer_bmminer() { # bmminer, / - rw, cron
 	cp -rf /hive/share/S9/S69hive /etc/rcS.d/
 	cp -rf /hive/share/S9/.profile /home/root/
 
-	/hive/bin/hive
+	echo_action 'Booting The Client'
+	/hive/bin/hive > /tmp/client-boot.log 2>&1
 
 	sleep 2
 
-	#$FARM_HASH can be defined externally
-	bash -c "/hive/bin/firstrun $FARM_HASH"
+	# FARM_HASH could be defined externaly or by command-line option
+	/hive/bin/firstrun "$FARM_HASH"
 }
 
-install_antminer_cgminer() { # cgminer, / - ro, no cron
-	echo ""
-	echo "> Extracting $filename"
-	if [ ! -d /config/hive ]; then
-		mkdir /config/hive
-	fi
-	tar -xzv -f $filename
-	cp -rf hiveos-asic-$release/* /config/hive/
-	[ $? -ne 0 ] && echo "Error extracting $filename" && exit 1
+install_antminer_cgminer () {
+	#
+	# cgminer, / - ro, no cron
+	#
 
-	rm $filename
+	[ ! -d /config/hive ] && mkdir /config/hive
+
+	echo_action 'Copying to /config/hive/'
+	cp -rf "hiveos-asic-${release_version_to_install}/"* /config/hive/ || die 'Copy error'
 
 	sleep 2
 
-	export PATH=$PATH:/hive/bin:/hive/sbin
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
 	export LD_LIBRARY_PATH=/hive/lib
-	
+
 	if [ ! -e /hive ]; then
 		ln -s /config/hive/hive/ /hive
 		ln -s /config/hive/hive-config/ /hive-config
 		ln -s /config/hive/home/root/.profile /home/root/.profile
 	fi
 
-	if grep "### HIVE AUTORUN ###" /config/network.conf || grep "ln -s /config/hive/hive/ /hive" /config/network.conf; then
-		echo "/config/network.conf skip"
+	if grep -Fq '### HIVE AUTORUN ###' /config/network.conf || grep -Fq 'ln -s /config/hive/hive/ /hive' /config/network.conf || [ -n "$HIVEON_VERSION" ]; then
+		echo_info 'Hiveon firmware found, /config/network.conf tampering skipped'
 	else
-		cat >> /config/network.conf <<FILEEOF
+		echo_info 'No Hiveon firmware found, injecting autorun into /config/network.conf'
+		cat >> /config/network.conf <<-FILEEOF
 
-### HIVE AUTORUN ###
-[ -e /config/hive_autorun ] && nohup /bin/sh -c '/config/hive_autorun' > /dev/null 2>&1 &
-FILEEOF
+			### HIVE AUTORUN ###
+			[ -e /config/hive_autorun ] && nohup /bin/sh -c '/config/hive_autorun' > /dev/null 2>&1 &
+		FILEEOF
 	fi
 	cp -rf /hive/bin/hive_autorun /config/hive_autorun
-	/hive/bin/hive
+
+	echo_action 'Booting The Client'
+	/hive/bin/hive > /tmp/client-boot.log 2>&1
 
 	#on cgminer's antminer no cron daemon, run tasks in background
-	nohup bash -c 'sleep 60; /hive/bin/cron1' > /dev/null 2>&1 &
-	nohup bash -c 'sleep 60; /hive/bin/cron2' > /dev/null 2>&1 &
+# legacy cron imitation
+# now it's a /hive/bin/controller built-in
+#	nohup bash -c 'sleep 60; /hive/bin/cron1' > /dev/null 2>&1 &
+#	nohup bash -c 'sleep 60; /hive/bin/cron2' > /dev/null 2>&1 &
 
 	sleep 2
 
-	#$FARM_HASH can be defined externally
-	bash -c "/hive/bin/firstrun $FARM_HASH"
+	# FARM_HASH could be defined externaly or by command-line option
+	/hive/bin/firstrun "$FARM_HASH"
 }
 
-install_antminer_Z9_cgminer() { # cgminer, / - rw, no cron
-	rm -rf /hive/sbin/teleconsole
-	if [[ -e /hive && ! -L /hive ]]; then
+install_antminer_Z9_cgminer () {
+	#
+	# cgminer, / - rw, no cron
+	#
+
+	if [ -e /hive ] && [ ! -L /hive ]; then
 		mkdir -p /config/hive
 		mv -f /hive /config/hive/
 		mv -f /hive-config /config/hive/
@@ -166,21 +171,17 @@ install_antminer_Z9_cgminer() { # cgminer, / - rw, no cron
 		ln -s /config/hive/hive-config/ /hive-config
 		ln -s /config/hive/home/root/.profile /home/root/.profile
 	fi
-	echo ""
-	echo "> Extracting $filename"
-	if [ ! -d /config/hive ]; then
-		mkdir /config/hive
-	fi
-	tar -xzv -f $filename
-	rm -rf hiveos-asic-$release/hive/sbin/teleconsole
-	cp -rf hiveos-asic-$release/* /config/hive/
-	[ $? -ne 0 ] && echo "Error extracting $filename" && exit 1
+	[ ! -d /config/hive ] && mkdir /config/hive
 
-	rm $filename
+	echo_action 'Copying to /config/hive/'
+	cp -rf "hiveos-asic-${release_version_to_install}/"* /config/hive/ || die 'Copy error'
 
 	sleep 2
 
-	export PATH=$PATH:/hive/bin:/hive/sbin
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
 	export LD_LIBRARY_PATH=/hive/lib
 
 	if [ ! -e /hive ]; then
@@ -188,147 +189,212 @@ install_antminer_Z9_cgminer() { # cgminer, / - rw, no cron
 		ln -s /config/hive/hive-config/ /hive-config
 		ln -s /config/hive/home/root/.profile /home/root/.profile
 	fi
-	
-	if grep "### HIVE AUTORUN ###" /config/network.conf || grep "ln -s /config/hive/hive/ /hive" /config/network.conf; then
-		echo "/config/network.conf skip"
-	else
-		cat >> /config/network.conf <<FILEEOF
 
-### HIVE AUTORUN ###
-[ -e /config/hive_autorun ] && nohup /bin/sh -c '/config/hive_autorun' > /dev/null 2>&1 &
-FILEEOF
+	if grep -Fq '### HIVE AUTORUN ###' /config/network.conf || grep -Fq 'ln -s /config/hive/hive/ /hive' /config/network.conf; then
+		echo_info '/config/network.conf skipped'
+	else
+		cat >> /config/network.conf <<-FILEEOF
+
+			### HIVE AUTORUN ###
+			[ -e /config/hive_autorun ] && nohup /bin/sh -c '/config/hive_autorun' > /dev/null 2>&1 &
+		FILEEOF
 	fi
 	cp -rf /hive/bin/hive_autorun /config/hive_autorun
-	/hive/bin/hive
+
+	echo_action 'Booting The Client'
+	/hive/bin/hive > /tmp/client-boot.log 2>&1
 
 	#on cgminer's antminer no cron daemon, run tasks in background
-	nohup bash -c 'sleep 60; /hive/bin/cron1' > /dev/null 2>&1 &
-	nohup bash -c 'sleep 60; /hive/bin/cron2' > /dev/null 2>&1 &
+# legacy cron imitation
+# now it's a /hive/bin/controller built-in
+#	nohup bash -c 'sleep 60; /hive/bin/cron1' > /dev/null 2>&1 &
+#	nohup bash -c 'sleep 60; /hive/bin/cron2' > /dev/null 2>&1 &
 
 	sleep 2
 
-	#$FARM_HASH can be defined externally
-	bash -c "/hive/bin/firstrun $FARM_HASH"
+	# FARM_HASH could be defined externaly or by command-line option
+	/hive/bin/firstrun "$FARM_HASH"
 }
 
+install_innosilicon () {
+	#
+	#
+	#
 
-install_innosilicon() {
-	echo ""
 	mount -o remount,rw,relatime,ubi=0,vol=0 -t ubifs ubi0:rootfs /
-	echo "> Extracting $filename"
-	if [ ! -d /config/hive ]; then
-		mkdir -p /config/hive
-	fi
-	if [ ! -d /hive ]; then
-		mkdir /hive
-	fi
-	tar -xzv -f $filename
-	cp -rf hiveos-asic-$release/hive-config /config/hive/
-	cp -rf hiveos-asic-$release/hive/bin /config/hive/
-	cp -rf hiveos-asic-$release/hive/etc /config/hive/
-	cp -rf hiveos-asic-$release/hive/sbin /hive/
-	cp -rf hiveos-asic-$release/hive/lib /hive/
-	cp -rf hiveos-asic-$release/home/root/.profile /etc/profile.d/hive.sh
-	cp -rf hiveos-asic-$release/hive/share/innosilicon/* /etc/systemd/system/
-	[ $? -ne 0 ] && echo "Error extracting $filename" && exit 1
+	[ ! -d /config/hive ]	&& mkdir -p /config/hive
+	[ ! -d /hive ]			&& mkdir /hive
 
-	rm $filename
+	### untar was right here
+
+	echo_action 'Copying'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive-config" /config/hive/						|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/bin" /config/hive/							|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/etc" /config/hive/							|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/sbin" /hive/									|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/lib" /hive/									|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/home/root/.profile" /etc/profile.d/hive.sh		|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/share/innosilicon/"* /etc/systemd/system/	|| die 'Copy error'
 
 	sleep 2
 
-	export PATH=$PATH:/hive/bin:/hive/sbin
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
 	export LD_LIBRARY_PATH=/hive/lib
-	
-	[ ! -L /hive/bin ] && [ ! -e /hive/bin ] && ln -s /config/hive/bin /hive/bin
-	[ ! -L /hive/etc ] && [ ! -e /hive/etc ] && ln -s /config/hive/etc /hive/etc
-	[ ! -L /hive-config ] && [ ! -e /hive-config ] && ln -s /config/hive/hive-config/ /hive-config
-	[ ! -L /hive/sbin/nc ] && [ ! -e /hive/sbin/nc ] && ln -s /hive/sbin/busybox.nosuid /hive/sbin/nc
+
+	[ ! -L /hive/bin ]		&& [ ! -e /hive/bin ]		&& ln -s /config/hive/bin /hive/bin
+	[ ! -L /hive/etc ]		&& [ ! -e /hive/etc ]		&& ln -s /config/hive/etc /hive/etc
+	[ ! -L /hive-config ]	&& [ ! -e /hive-config ]	&& ln -s /config/hive/hive-config/ /hive-config
+	[ ! -L /hive/sbin/nc ]	&& [ ! -e /hive/sbin/nc ]	&& ln -s /hive/sbin/busybox.nosuid /hive/sbin/nc
 
 	#systemd autorun and cron
 	systemctl daemon-reload
 	systemctl is-enabled hive.service > /dev/null
-	[[ $? == 1 ]] && systemctl enable hive.service
+	[ $? -eq 1 ] && systemctl enable hive.service
 	systemctl start hive.service
 	systemctl is-enabled hive-agent-screen.timer > /dev/null
-	[[ $? == 1 ]] && systemctl enable hive-agent-screen.timer
+	[ $? -eq 1 ] && systemctl enable hive-agent-screen.timer
 	systemctl start hive-agent-screen.timer
 	systemctl is-enabled hive-cache-ip.timer > /dev/null
-	[[ $? == 1 ]] && systemctl enable hive-cache-ip.timer
+	[ $? -eq 1 ] && systemctl enable hive-cache-ip.timer
 	systemctl start hive-cache-ip.timer
 
 	sleep 2
 	nohup sync && sleep 600 && mount -o remount,ro,relatime,ubi=0,vol=0 -t ubifs ubi0:rootfs / &
 
-	#$FARM_HASH can be defined externally
-	bash -c "/hive/bin/firstrun $FARM_HASH"
+	# FARM_HASH could be defined externaly or by command-line option
+	/hive/bin/firstrun "$FARM_HASH"
+	systemctl start hive.service
 }
 
+install_dragonMint () {
+	#
+	#
+	#
 
+	mount -o remount,rw,relatime -t ubifs ubi0:rootfs /
+	[ ! -d /config/hive ]	&& mkdir -p /config/hive
+	[ ! -d /hive ]			&& mkdir /hive
 
-install_innosilicon_innominer() {
-	echo ""
+	### untar was right here
+
+	echo_action 'Copying'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive-config" /config/hive/						|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/bin" /config/hive/							|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/etc" /config/hive/							|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/sbin" /hive/									|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/lib" /hive/									|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/home/root/.profile" /etc/profile.d/hive.sh		|| die 'Copy error'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive/share/innosilicon/"* /etc/systemd/system/	|| die 'Copy error'
+
+	sleep 2
+
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
+	export LD_LIBRARY_PATH=/hive/lib
+
+	[ ! -L /hive/bin ]		&& [ ! -e /hive/bin ]		&& ln -s /config/hive/bin /hive/bin
+	[ ! -L /hive/etc ]		&& [ ! -e /hive/etc ]		&& ln -s /config/hive/etc /hive/etc
+	[ ! -L /hive-config ]	&& [ ! -e /hive-config ]	&& ln -s /config/hive/hive-config/ /hive-config
+	[ ! -L /hive/sbin/nc ]	&& [ ! -e /hive/sbin/nc ]	&& ln -s /hive/sbin/busybox.nosuid /hive/sbin/nc
+
+	#systemd autorun and cron
+	systemctl daemon-reload
+	systemctl is-enabled hive.service > /dev/null
+	[ $? -eq 1 ] && systemctl enable hive.service
+	systemctl start hive.service
+	systemctl is-enabled hive-agent-screen.timer > /dev/null
+	[ $? -eq 1 ] && systemctl enable hive-agent-screen.timer
+	systemctl start hive-agent-screen.timer
+	systemctl is-enabled hive-cache-ip.timer > /dev/null
+	[ $? -eq 1 ] && systemctl enable hive-cache-ip.timer
+	systemctl start hive-cache-ip.timer
+
+	sleep 2
+	nohup sync && sleep 600 && mount -o remount,ro,relatime -t ubifs ubi0:rootfs / &
+
+	# FARM_HASH could be defined externaly or by command-line option
+	/hive/bin/firstrun "$FARM_HASH"
+	systemctl start hive.service
+}
+
+install_innosilicon_innominer () {
+	#
+	#
+	#
+
 	mount -o remount,rw,relatime -t jffs2 /dev/root /
-
-	echo "> Extracting $filename"
 	[ ! -d /hive ] && mkdir /hive
-	tar -xzv -f $filename
-	cp -rf hiveos-asic-$release/hive-config /innocfg/
-	cp -rf hiveos-asic-$release/hive /
-#	cp -rf hiveos-asic-$release/home/root/.profile /etc/profile.d/hive.sh
-	[ $? -ne 0 ] && echo "Error extracting $filename" && exit 1
-	rm $filename
+
+	### untar was right here
+
+	echo_action 'Copying to /innocfg'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive-config" /innocfg/						|| die 'Copy error'
+	echo_action 'Copying to /'
+	cp -rf "hiveos-asic-${release_version_to_install}/hive" /										|| die 'Copy error'
+#	cp -rf "hiveos-asic-${release_version_to_install}/home/root/.profile" /etc/profile.d/hive.sh	|| die 'Copy error'
 
 	[ ! -L /hive-config ] && [ ! -e /hive-config ] && ln -s /innocfg/hive-config/ /hive-config
 
 	#autorun
-	if grep "### HIVE AUTORUN ###" /etc/init.d/rcS; then
-		echo "/etc/init.d/rcS skip"
+	if grep -Fq '### HIVE AUTORUN ###' /etc/init.d/rcS; then
+		echo_info '/etc/init.d/rcS skipped'
 	else
-		cat >> /etc/init.d/rcS <<FILEEOF
+		cat >> /etc/init.d/rcS <<-FILEEOF
 
-### HIVE AUTORUN ###
-[ -e /hive/bin/hive ] && nohup /hive/sbin/bash -c 'sleep 30; /hive/bin/hive > /tmp/hive-boot.log; echo "Running hive..."' > /dev/null 2>&1 &
-[ -e /hive/bin/hello ] && nohup /hive/sbin/bash -c 'sleep 40; /hive/bin/hello' > /dev/null 2>&1 &
-[ -e /hive/bin/cron1 ] && nohup /hive/sbin/bash -c 'sleep 60; /hive/bin/cron1' > /dev/null 2>&1 &
-[ -e /hive/bin/cron2 ] && nohup /hive/sbin/bash -c 'sleep 60; /hive/bin/cron2' > /dev/null 2>&1 &
-FILEEOF
+			### HIVE AUTORUN ###
+			[ -e /hive/bin/hive ] && nohup /hive/sbin/bash -c 'sleep 30; /hive/bin/hive > /tmp/client-boot.log 2>&1; echo "Running The Client..."' > /dev/null 2>&1 &
+			[ -e /hive/bin/hello ] && nohup /hive/sbin/bash -c 'sleep 40; /hive/bin/hello' > /dev/null 2>&1 &
+		FILEEOF
+# legacy cron imitation
+# now it's a /hive/bin/controller built-in
+#			[ -e /hive/bin/cron1 ] && nohup /hive/sbin/bash -c 'sleep 60; /hive/bin/cron1' > /dev/null 2>&1 &
+#			[ -e /hive/bin/cron2 ] && nohup /hive/sbin/bash -c 'sleep 60; /hive/bin/cron2' > /dev/null 2>&1 &
 	fi
 
 	#PATH
-	if grep "### HIVE PROFILE ###" /etc/profile; then
-		echo "/etc/profile skip"
+	if grep -Fq '### HIVE PROFILE ###' /etc/profile; then
+		echo_info '/etc/profile skipped'
 	else
-		cat >> /etc/profile <<FILEEOF
+		cat >> /etc/profile <<-FILEEOF
 
-### HIVE PROFILE ###
-export PATH=$PATH:/hive/bin:/hive/sbin
-export LD_LIBRARY_PATH=/hive/lib
-FILEEOF
+			### HIVE PROFILE ###
+			case "\$PATH" in
+			    *'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+			    *)							export PATH="\$PATH:/hive/bin:/hive/sbin"	;;
+			esac
+			export LD_LIBRARY_PATH=/hive/lib
+		FILEEOF
 	fi
 
-	export PATH=$PATH:/hive/bin:/hive/sbin
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
 	export LD_LIBRARY_PATH=/hive/lib
 
 	sync
 	sleep 5
 	mount -o remount,ro,relatime -t jffs2 /dev/root /
 
-	/hive/bin/hive
-	#$FARM_HASH can be defined externally
-	bash -c "/hive/bin/firstrun $FARM_HASH"
+	echo_action 'Booting The Client'
+	/hive/bin/hive > /tmp/client-boot.log 2>&1
+
+	# FARM_HASH could be defined externaly or by command-line option
+	/hive/bin/firstrun "$FARM_HASH"
 }
 
+install_zig () {
+	#
+	#
+	#
 
-
-install_zig() {
-	echo ""
-	echo "> Extracting $filename"
-	tar -xzv -f $filename
-#	rm -rf hiveos-asic-$release/hive/sbin/teleconsole
-	cp -rf hiveos-asic-$release/* /
-	[ $? -ne 0 ] && echo "Error extracting $filename" && exit 1
-
-	rm $filename
+	echo_action 'Copying to /'
+	cp -rf "hiveos-asic-${release_version_to_install}/"* / || die 'Copy error'
 
 	sleep 2
 
@@ -338,16 +404,20 @@ install_zig() {
 	/etc/init.d/cron restart
 	apt update
 	apt install -y curl screen jq
-	sed -i 's/#!\/bin\/sh/#!\/bin\/bash/g' /hive/bin/selfupgrade
-	export PATH=$PATH:/hive/bin:/hive/sbin
+	sed -i 's/#!\/bin\/sh/#!\/bin\/bash/g' "/hive/bin/$script_basename"
+	case "$PATH" in
+		*'/hive/bin:/hive/sbin'*)	: ok good to go								;;
+		*)							export PATH="$PATH:/hive/bin:/hive/sbin"	;;
+	esac
 	export LD_LIBRARY_PATH=/hive/lib
 
-	/hive/bin/hive
+	echo_action 'Booting The Client'
+	/hive/bin/hive > /tmp/client-boot.log 2>&1
 
 	sleep 2
 
-	#$FARM_HASH can be defined externally
-	bash -c "/hive/bin/firstrun $FARM_HASH"
+	# FARM_HASH could be defined externaly or by command-line option
+	/hive/bin/firstrun "$FARM_HASH"
 }
 
 install_whatsminer() { # whatsminer, / - ro
@@ -406,9 +476,6 @@ elif echo "$ASIC_MODEL" | grep -q -s -F "Antminer S9 (vnish"; then
 elif echo "$ASIC_MODEL" | grep -q -s -F "Antminer S9"; then
 	echo "Install Antminer S9"
 	install_antminer_bmminer
-elif echo "$ASIC_MODEL" | grep -q -s -F "WhatsMiner"; then
-	echo "Install WhatsMiner"
-	install_whatsminer
 elif [ "$ASIC_MODEL" == "Antminer " ]; then
 	echo "Install Antminer B3"
 	install_antminer_bmminer
@@ -490,4 +557,4 @@ agent-screen dontattach
 echo -e "${GREEN}Upgrade complete. Have a happy mining.${NOCOLOR}"
 
 sync
-exit 0
+exit "$exitcode_OK"
